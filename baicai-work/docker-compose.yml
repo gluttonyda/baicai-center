@@ -1,0 +1,36 @@
+services:
+  worker-api:
+    build: .
+    container_name: baicai-worker-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    command: ["python", "worker.py"]
+    ports:
+      - "8001:8001"
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - /data/links:/data/links
+      - /data/rclone-cache:/data/rclone-cache
+      - ./logs/rclone:/data/logs/rclone
+      - ./runtime:/opt/baicai-worker/runtime
+      - /usr/bin/rclone:/usr/bin/rclone:ro
+      - /root/.config/rclone:/root/.config/rclone
+
+  scanner:
+    build: .
+    container_name: baicai-worker-scanner
+    restart: unless-stopped
+    env_file:
+      - .env
+    command: ["/bin/bash", "/app/scanner-loop.sh"]
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - /data/links:/data/links
+      - /data/rclone-cache:/data/rclone-cache
+      - ./logs/rclone:/data/logs/rclone
+      - ./runtime:/opt/baicai-worker/runtime
+      - /usr/bin/rclone:/usr/bin/rclone:ro
+      - /root/.config/rclone:/root/.config/rclone

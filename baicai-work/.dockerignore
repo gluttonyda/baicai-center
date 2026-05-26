@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+.env
+logs/
+runtime/
+links/
+rclone-cache/
+scanner_cache.db

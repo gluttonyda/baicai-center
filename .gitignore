@@ -1,0 +1,43 @@
+# Secrets and deployment-local config
+.env
+.env.*
+!.env.example
+!**/.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+rclone.conf
+
+# Python/runtime artifacts
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Logs, caches, and generated runtime data
+*.log
+logs/
+runtime/
+scanner_cache.db
+failed_init_sync_chunks/
+
+# Backups and production data snapshots
+backups/
+db-backups/
+*.sql.gz
+*.tar.gz
+/IMPORT_DRIVE_ACCOUNTS.sql
+
+# Local audit/dedupe outputs that may include private media paths
+dedupe_*.log
+duplicate_*.txt
+docs/cleanup-logs/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
