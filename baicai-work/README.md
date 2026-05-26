@@ -1,42 +1,105 @@
 # baicai-work
 
-This directory contains the Worker-side deployment bundle.
+`baicai-work/` 是 Baicai Worker 节点运行包。
 
-## Files
+Worker 部署在实际搬运机器上，负责扫描本地文件、接收 Center 调度、调用 `rclone` 上传或清理文件。
 
-- `worker.py`: receives upload and cleaner tasks from Center
-- `scanner.py`: scans local directories and reports files to Center
-- `Dockerfile`: image build for Worker runtime
-- `docker-compose.yml`: runs `worker-api` and `scanner`
-- `.env.example`: Worker-side environment template
-- `scanner-loop.sh`: periodic scanner runner inside container
+## 文件说明
 
-## Quick Start
+- `worker.py`：Worker FastAPI 服务，接收 Center 派发
+- `scanner.py`：扫描本地目录并向 Center 上报文件
+- `scanner-loop.sh`：容器内循环执行 scanner
+- `Dockerfile`：Worker 镜像构建
+- `docker-compose.yml`：Worker API + Scanner 编排
+- `.env.example`：Worker 配置模板
+- `requirements.txt`：Python 依赖
 
-1. Copy the env template:
-   `cp .env.example .env`
-2. Adjust at least:
-   - `API_TOKEN`
-   - `WORKER_NODE_NAME`
-   - `WORKER_API_URL`
-   - `CENTER_URL`
-   - `CENTER_API`
-3. Ensure the host has a usable rclone config at `/root/.config/rclone/rclone.conf`
-4. Start services:
-   `docker compose up -d --build`
+## 快速启动
 
-## Host Directories
+复制配置：
 
-Compose mounts these host paths from the current directory:
+```bash
+cp .env.example .env
+```
 
-- `./links -> /data/links`
-- `./rclone-cache -> /data/rclone-cache`
-- `./logs/rclone -> /data/logs/rclone`
-- `./runtime -> /opt/baicai-worker/runtime`
+至少填写：
 
-## Notes
+```text
+API_TOKEN
+CENTER_URL
+CENTER_API
+WORKER_NODE_NAME
+WORKER_API_URL
+TARGET_REMOTE_DIR
+```
 
-- `worker-api` listens on port `8001`
-- `scanner` runs in a loop controlled by `SCANNER_LOOP_SECONDS`
-- If Center database was reset, remove the scanner cache before re-scanning:
-  `rm -f runtime/scanner_cache.db`
+确认宿主机有 rclone 配置：
+
+```text
+/root/.config/rclone/rclone.conf
+```
+
+启动：
+
+```bash
+docker compose up -d --build
+```
+
+## 默认挂载
+
+```text
+./links        -> /data/links
+./rclone-cache -> /data/rclone-cache
+./logs/rclone  -> /data/logs/rclone
+./runtime      -> /opt/baicai-worker/runtime
+```
+
+Scanner 会扫描：
+
+- `/data/links`
+- `/data/rclone-cache`
+
+Worker 只会处理 `ALLOWED_BASE_DIRS` 白名单下的路径。
+
+## 服务
+
+`docker-compose.yml` 默认包含：
+
+- `worker-api`：监听 `8001`，接收 Center 任务
+- `scanner`：按 `SCANNER_LOOP_SECONDS` 循环扫描
+
+查看状态：
+
+```bash
+docker compose ps
+```
+
+查看日志：
+
+```bash
+docker compose logs -f worker-api
+docker compose logs -f scanner
+```
+
+## 重扫注意
+
+如果 Center 数据库重置过，需要删除 Worker 本地扫描缓存：
+
+```bash
+rm -f runtime/scanner_cache.db
+```
+
+否则 scanner 会认为历史文件已经上报过。
+
+## 安全注意
+
+不要提交：
+
+- `.env`
+- `runtime/`
+- `logs/`
+- `links/`
+- `rclone-cache/`
+- `rclone.conf`
+
+这些文件可能包含真实凭据、日志或媒体路径。

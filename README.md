@@ -1,180 +1,264 @@
-# Baicai-Center 运行目录说明
+# Baicai Center
 
-本目录是 `baicai-center` 的生产运行目录，当前代码基于已验证的测试副本同步整理而来，用于后续运行、维护和回归。
+Baicai Center 是一个用于分布式 Google Drive 搬运的主控调度系统。
 
-## 部署前提
+它的核心目标是让一个中心节点充当“主控大脑”，统一接收文件清单、管理账号池、调度多个地区的 Worker 节点，并在 Google Drive 上传配额触发后自动切换账号继续搬运。
 
-- 架构模型：单 `Center` 对接多个 `Worker`
-- 当前目录已作为后续运行与维护基线，相关文档和测试资产已按目录整理
-- 所有敏感配置通过环境变量或 `.env` 文件注入
+> 本项目不是 Google 官方项目。它依赖 `rclone` 和你自己的 Google Drive / Shared Drive / Service Account / OAuth 配置。
+
+## 适用场景
+
+- 多地区服务器共同搬运同一批文件
+- 多个 Google Drive 账号轮换上传
+- 单账号触发 403 upload limit 后自动冷却并切换账号
+- 先搬到中转盘，再由专用 cleaner 账号清理到最终大盘
+- 大盘已有文件先做历史同步，避免重复搬运
+
+## 架构概览
+
+```text
+                    +----------------------+
+                    |      Center Node     |
+                    |  FastAPI + Scheduler |
+                    |        MySQL         |
+                    +----------+-----------+
+                               |
+             dispatch task     | report status / files
+                               |
+        +----------------------+----------------------+
+        |                      |                      |
++-------+--------+     +-------+--------+     +-------+--------+
+| Worker Node A  |     | Worker Node B  |     | Worker Node C  |
+| region/account |     | region/account |     | region/account |
+| scanner+rclone |     | scanner+rclone |     | scanner+rclone |
++-------+--------+     +-------+--------+     +-------+--------+
+        |
+        | rclone copy / move
+        v
+ uploader staging drives  ->  cleaner accounts  ->  final target drive
+```
 
 ## 核心组件
 
-### `main.py`
+### Center
 
-- 负责任务入库、调度、状态回传和清道夫派发
-- 已增加输入校验、Worker 地址白名单、下发失败回滚和 `uploading` 心跳处理
-- 已拆分 `dispatch_locked_until` 与 `quota_blocked_until`
-- 清道夫策略已升级为“两段式”：
-  - 同组仍在上传时绝不清理
-  - 全组 uploader 配额耗尽时立即清理
-  - 未耗尽时等待空闲窗口后再清理
+根目录是 Center 节点代码：
 
-### `baicai-work/`
+- `main.py`：FastAPI API、任务调度器、账号锁、状态机、cleaner 派发
+- `init_sync.py`：把目标盘已有文件注入数据库，建立防重复屏障
+- `SCHEMA_MINIMAL.sql`：最小可运行表结构
+- `MIGRATION_SPLIT_ACCOUNT_LOCKS.sql`：账号锁字段拆分迁移
+- `scripts/`：数据库检查和维护脚本
 
-- 放置 `Worker` 节点运行包，包括 `worker.py`、`scanner.py`、`docker-compose.yml` 与 `.env` 模板
-- `worker.py` 负责执行上传与清道夫任务，已支持长任务心跳、状态回传和路径越界校验
-- `scanner.py` 负责扫描 `/data/links` 与 `/data/rclone-cache`，并按延迟窗口向 Center 流式上报
+Center 维护三类状态：
 
-### `init_sync.py`
+- `file_tasks`：文件任务状态
+- `drive_accounts`：上传账号、cleaner 账号、账号锁和配额封禁
+- `worker_registry`：Worker 节点注册地址和活跃时间
 
-- 负责将大盘现有文件流式注入 Center，建立防重屏障
-- 已改为边读边分块提交，失败时返回非零退出码
+### Worker
+
+`baicai-work/` 是 Worker 节点运行包：
+
+- `worker.py`：接收 Center 派发，执行 `rclone copy/move`
+- `scanner.py`：扫描本地目录并上报 Center
+- `scanner-loop.sh`：容器内定时扫描入口
+- `docker-compose.yml`：Worker API + Scanner 部署模板
+
+Worker 默认监听：
+
+```text
+/task/upload
+```
+
+Center 默认暴露：
+
+```text
+GET  /
+POST /api/report_files
+POST /api/report_status
+```
+
+## 搬运流程
+
+1. Scanner 扫描 Worker 本地目录。
+2. Scanner 调用 Center 的 `/api/report_files` 上报待搬运文件。
+3. Center 将文件写入 `file_tasks`，初始状态为 `pending`。
+4. Center 定时选择可用 Worker 和可用 uploader 账号。
+5. Worker 收到任务后用 `rclone copy` 或 `rclone move` 执行搬运。
+6. 普通 uploader 成功后，任务进入 `staged`。
+7. Cleaner 账号把 `staged` 文件从中转盘移动到最终目标盘。
+8. Cleaner 成功后，任务进入 `completed`。
+
+任务状态：
+
+```text
+pending -> uploading -> staged -> completed
+                    \-> failed / not_found
+                    \-> 403_quota
+```
+
+## 账号与锁
+
+账号分为：
+
+- `uploader`：执行上传或移动
+- `cleaner`：把中转盘文件清理到目标盘
+- `vip`：预留角色
+
+账号锁拆分为：
+
+- `dispatch_locked_until`：短期调度执行锁，防止同一账号被重复派发
+- `quota_blocked_until`：403 quota 后的封禁锁，默认 24 小时
+
+当 Worker 上报 `403_quota`：
+
+1. Center 释放短期调度锁。
+2. Center 写入 `quota_blocked_until`。
+3. 当前未完成任务回退到 `pending`。
+4. Center 立即触发新一轮 uploader 调度。
+
+Cleaner 策略：
+
+- 同组仍有 `uploading` 时绝不清理
+- 同组 uploader 全部 quota 封禁时立即清理
+- 未全部封禁时，等待空闲窗口达到 `CLEANER_IDLE_MINUTES` 后清理
 
 ## 快速开始
 
-### 1. 准备配置
-
-复制示例配置：
+### 1. 准备 Center 配置
 
 ```bash
 cp .env.example .env
 ```
 
-至少检查这些变量：
+至少填写：
 
-- `API_TOKEN`
-- `DB_HOST`
-- `DB_USER`
-- `DB_PASSWORD`
-- `DB_NAME`
-- `WORKER_API_URL_MAP`
-- `CENTER_URL`
-- `CENTER_API`
-- `WORKER_NODE_NAME`：如果运行 `init_sync.py`，这里必须设为 `Init_Scanner`
+```text
+API_TOKEN
+DB_HOST
+DB_USER
+DB_PASSWORD
+DB_NAME
+WORKER_API_URL_MAP
+```
 
-### 2. 启动 Center
+启动 Center：
 
 ```bash
 docker compose up -d --build
 ```
 
-启动后可访问根接口确认存活：
+健康检查：
 
 ```bash
 curl http://127.0.0.1:8080/
 ```
 
-### 2.1 执行账号锁字段迁移
+### 2. 初始化数据库
 
-如果当前代码包含 `dispatch_locked_until` / `quota_blocked_until` 逻辑，上线前需要先执行：
+首次部署可参考：
+
+```bash
+mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASSWORD" "$DB_NAME" < SCHEMA_MINIMAL.sql
+```
+
+如果是旧库升级，需要执行：
 
 ```bash
 mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASSWORD" "$DB_NAME" < MIGRATION_SPLIT_ACCOUNT_LOCKS.sql
 ```
 
-说明：
+### 3. 建立历史防重复屏障
 
-- 旧 `cooldown_until` 历史上混用了“调度锁”和“403 配额封禁”，不能自动精确拆分
-- 新代码只读取 `dispatch_locked_until` / `quota_blocked_until`
-- 若需保留历史状态，需在上线前人工判别并写入新字段
-
-### 3. 建立防重护城河
-
-首次部署或重置 `file_tasks` 后，先执行：
+如果目标盘已经有大量文件，先同步历史文件：
 
 ```bash
 python init_sync.py
 ```
 
-成功后会输出历史同步摘要。
+执行前确认：
 
-执行 `init_sync.py` 前请确认：
-
-- `WORKER_NODE_NAME=Init_Scanner`
-- 不要使用任何真实 Worker 节点名，否则会覆盖 `worker_registry` 中真实节点的注册地址
-
-### 4. 清理 Worker 扫描缓存
-
-如果你重置过 Center 数据库，必须在每个 Worker 节点执行：
-
-```bash
-rm -f /opt/baicai-worker/scanner_cache.db
+```text
+WORKER_NODE_NAME=Init_Scanner
+RCLONE_REMOTE_ACCOUNT=your-rclone-remote
+TARGET_DIR=your-target-dir
 ```
 
-否则 Worker 会误以为历史文件已经上报过。
+不要用真实 Worker 节点名运行 `init_sync.py`，否则可能覆盖真实 Worker 的注册地址。
 
-## 测试说明
+### 4. 部署 Worker
 
-- 当前目录已收敛为生产运行目录，不再保留历史测试副本与测试缓存
-- 如需做 Center 回归，请在独立测试副本中执行，不要直接在生产目录运行全量测试
-- `Worker` 联调与容器启动文件统一位于 `baicai-work/`
+进入 Worker 包：
 
-## 关键环境变量
+```bash
+cd baicai-work
+cp .env.example .env
+```
 
-### Center
+至少填写：
 
-- `API_TOKEN`
-- `DB_HOST`
-- `DB_USER`
-- `DB_PASSWORD`
-- `DB_NAME`
-- `WORKER_API_URL_MAP`
-- `MAX_FILES_PER_REQUEST`
-- `MAX_SUCCESSFUL_FILES`
-- `MAX_MISSING_FILES`
-- `MAX_CLEANER_FILES_PER_REQUEST`
-- `CLEANER_IDLE_MINUTES`
-- `ACCOUNT_DISPATCH_LEASE_MINUTES`
-- `QUOTA_BLOCK_HOURS`
+```text
+API_TOKEN
+CENTER_URL
+CENTER_API
+WORKER_NODE_NAME
+WORKER_API_URL
+TARGET_REMOTE_DIR
+```
 
-### Worker
+启动 Worker：
 
-- `CENTER_URL`
-- `TARGET_REMOTE_DIR`
-- `ALLOWED_BASE_DIRS`
+```bash
+docker compose up -d --build
+```
 
-### Scanner
+如果 Center 数据库重置过，清理 Worker 本地扫描缓存：
 
-- `CENTER_API`
-- `WORKER_NODE_NAME`
-- `WORKER_API_URL`
-- `CACHE_DB_PATH`
-- `SCANNER_CHUNK_SIZE`
-- `LINKS_DELAY_HOURS`
-- `RCLONE_CACHE_DELAY_HOURS`
+```bash
+rm -f runtime/scanner_cache.db
+```
 
-### Init Sync
+## 测试
 
-- `RCLONE_REMOTE_ACCOUNT`
-- `TARGET_DIR`
-- `INIT_SYNC_CHUNK_SIZE`
+本仓库的测试需要同时把根目录和 `baicai-work/` 放进 `PYTHONPATH`：
 
-## 已完成的关键整改
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+pip install -r baicai-work/requirements.txt
+PYTHONPATH=.:baicai-work pytest -q
+```
 
-- 配置从硬编码迁移到环境变量读取
-- Worker 上报和 Center 派发均增加 HTTP 失败显式处理
-- `uploading` 心跳可刷新节点活跃时间
-- 0 文件命中不再误判为成功，改为 `not_found`
-- Worker 路径增加越界防护
-- Scanner 增加异常日志和统计摘要
-- 历史同步改为流式分块提交
-- 清理条件改为“上传活跃时绝不清、全组 quota 耗尽立即清、否则空闲后再清”
-- 账号锁已拆分为调度锁和 quota 封禁锁
-- `Worker` 上传命令已启用 `rclone --drive-stop-on-upload-limit`
-- 一旦 uploader 里的 `rclone` 结束当前任务并以非零退出码返回，`Worker` 会上报 `403_quota`
-- Center 收到 `403_quota` 后会将该账号写入 `quota_blocked_until` 封禁 24 小时，并把剩余任务回退给新账号继续
-- `403_quota` / `credential_invalid` 回执都会立即触发一次 uploader 重调度，不必等待 60 秒巡检
-- Uploader 不再产出 `retry_later`，也不再基于日志里的限流关键词或“无有效速度”单独触发 `403_quota`
-- Uploader 与 Cleaner 现在都只保留标准输出日志，不再额外双写本地明细日志
-- 现在 uploader 里只要 `rclone` 以非零退出码结束当前任务，就会导致账号切换和 24 小时封禁
-- 增加回归测试覆盖 `main.py`、`worker.py`、`scanner.py`、`init_sync.py`
-- 增加多 Worker 分发测试和 Worker 真实 `rclone` 往返测试
+当前基线：
 
-## 注意事项
+```text
+73 passed
+```
 
-- 若后续继续做大改，请先在独立测试副本完成联调，再回灌当前运行目录
-- 若 `WORKER_API_URL_MAP` 非空，则 Center 只接受白名单中的 `worker_node`
-- `force_all=True` 只能绕过“策略等待”，不能绕过“同组仍在上传”的安全挡板
-- 账号组的判定规则依赖命名约定：默认取账号名中 `@` 之前的前缀作为组名，例如 `baicai_1@1 -> baicai_1`
-- 生产切换前至少要完成一次真实测试库迁移验证和一次双 Worker 联调
+## 安全说明
+
+不要提交真实运行配置：
+
+- `.env`
+- `baicai-work/.env`
+- `rclone.conf`
+- 数据库备份
+- 运行日志
+- 重复文件清单
+- 本地扫描缓存
+
+本仓库已通过 `.gitignore` 忽略这些内容。公开仓库中只应保留 `.env.example`。
+
+## 文档
+
+- [文档索引](docs/README.md)
+- [Center 节点说明](docs/center_node.md)
+- [Worker 节点说明](docs/worker_node.md)
+- [部署分类说明](docs/部署分类说明.md)
+- [配置任务清单](docs/配置任务清单.md)
+
+## License
+
+当前仓库尚未声明开源协议。公开前请根据你的使用意图补充 `LICENSE`。

@@ -1,229 +1,141 @@
-# Baicai-Center 运行目录说明
+# 文档索引
 
-本目录对应 `baicai-center` 当前运行代码的总览说明，代码基于已验证的测试副本同步整理而来。
+这里整理 Baicai Center 的部署、配置和运行说明。
 
-## 部署前提
+Baicai Center 的定位是分布式 Google Drive 搬运主控系统：一个 Center 统一管理任务、账号池和调度，多个 Worker 分布在不同地区或不同机器上执行 `rclone` 搬运。
 
-- 架构模型：单 `Center` 对接多个 `Worker`
-- 当前目录已作为后续运行与维护基线，相关文档和测试资产已按目录整理
-- 所有敏感配置通过环境变量或 `.env` 文件注入
+## 推荐阅读顺序
 
-## 核心组件
+1. [根 README](../README.md)：项目用途、架构、快速开始
+2. [部署分类说明](部署分类说明.md)：哪些文件放 Center，哪些文件放 Worker
+3. [配置任务清单](配置任务清单.md)：部署前逐项检查配置
+4. [Center 节点说明](center_node.md)：Center API、数据库、调度策略
+5. [Worker 节点说明](worker_node.md)：Worker API、Scanner、rclone 执行逻辑
 
-### `main.py`
+## 系统角色
 
-- 负责任务入库、调度、状态回传和清道夫派发
-- 已增加输入校验、Worker 地址白名单、下发失败回滚和 `uploading` 心跳处理
-- 已拆分 `dispatch_locked_until` 与 `quota_blocked_until`
-- 清道夫策略已升级为“两段式”：
-  - 同组仍在上传时绝不清理
-  - 全组 uploader 配额耗尽时立即清理
-  - 未耗尽时等待空闲窗口后再清理
+### Center
 
-### `worker.py`
+Center 是主控大脑，负责：
 
-- 负责执行上传与清道夫任务
-- 已增加路径越界校验、`not_found` 状态回传、中心状态上报重试和日志目录回退
-- 已支持上传/清理长任务心跳回执
-- 已补充 API 入口测试与本地 `rclone` 往返联调测试
+- 接收 Worker 上报的文件清单
+- 维护 `file_tasks`
+- 维护 `drive_accounts`
+- 选择可用 Worker 和可用账号
+- 派发 uploader 任务
+- 根据 `staged` 状态派发 cleaner 任务
+- 处理 `403_quota`、`failed`、`not_found`、`credential_invalid`
 
-### `scanner.py`
+### Worker
 
-- 负责扫描 `/data/links` 与 `/data/rclone-cache`
-- 已增加扫描摘要日志、按异常类型记录错误、NFC 规范化和环境变量配置
+Worker 是执行节点，负责：
 
-### `init_sync.py`
+- 扫描本地目录
+- 向 Center 上报新文件
+- 接收 Center 派发的上传任务
+- 调用 `rclone copy` / `rclone move`
+- 周期性上报 `uploading` 心跳
+- 上报最终状态
 
-- 负责将大盘现有文件流式注入 Center，建立防重屏障
-- 已改为边读边分块提交，失败时返回非零退出码
+### Cleaner
 
-## 快速开始
+Cleaner 是一种专用账号任务，不是单独服务。它由 Worker 执行，但账号角色是 `cleaner`。
 
-### 1. 准备配置
+它负责把普通 uploader 已经搬到中转盘的文件继续移动到最终目标盘。
 
-复制示例配置：
+## 核心数据流
 
-```bash
-cp .env.example .env
+```text
+Scanner
+  -> Center /api/report_files
+  -> file_tasks.pending
+  -> Center scheduler
+  -> Worker /task/upload
+  -> rclone copy/move
+  -> Center /api/report_status
+  -> staged / completed / failed / not_found
 ```
 
-至少检查这些变量：
+Cleaner 数据流：
 
-- `API_TOKEN`
-- `DB_HOST`
-- `DB_USER`
-- `DB_PASSWORD`
-- `DB_NAME`
-- `WORKER_API_URL_MAP`
-- `CENTER_URL`
-- `CENTER_API`
-- `WORKER_NODE_NAME`：如果运行 `init_sync.py`，这里必须设为 `Init_Scanner`
+```text
+file_tasks.staged
+  -> Center cleaner scheduler
+  -> Worker /task/upload task_type=clean
+  -> rclone move
+  -> Center /api/report_status clean_success
+  -> file_tasks.completed
+```
 
-### 2. 启动 Center
+## 关键策略
+
+### 账号锁
+
+- `dispatch_locked_until`：防止同一账号短时间重复派发
+- `quota_blocked_until`：账号触发上传配额后的封禁时间
+
+### quota 处理
+
+当 Worker 发现当前 `rclone` 任务以非零退出码结束时，会上报 `403_quota`。
+
+Center 收到后会：
+
+1. 给账号写入 `quota_blocked_until`
+2. 把仍在 `uploading` 的任务回退到 `pending`
+3. 立即触发下一轮调度
+
+### cleaner 处理
+
+Cleaner 不会在同组仍上传时抢跑。
+
+允许清理的情况：
+
+- 同组 uploader 全部 quota blocked
+- 或同组已达到 `CLEANER_IDLE_MINUTES` 空闲窗口
+
+## 常用命令
+
+### Center 启动
 
 ```bash
 docker compose up -d --build
 ```
 
-启动后可访问根接口确认存活：
+### Worker 启动
+
+```bash
+cd baicai-work
+docker compose up -d --build
+```
+
+### Center 健康检查
 
 ```bash
 curl http://127.0.0.1:8080/
 ```
 
-### 2.1 执行账号锁字段迁移
-
-如果当前代码包含 `dispatch_locked_until` / `quota_blocked_until` 逻辑，上线前需要先执行：
+### 运行测试
 
 ```bash
-mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASSWORD" "$DB_NAME" < center_node/MIGRATION_SPLIT_ACCOUNT_LOCKS.sql
+PYTHONPATH=.:baicai-work pytest -q
 ```
 
-说明：
-
-- 旧 `cooldown_until` 历史上混用了“调度锁”和“403 配额封禁”，不能自动精确拆分
-- 新代码只读取 `dispatch_locked_until` / `quota_blocked_until`
-- 若需保留历史状态，需在上线前人工判别并写入新字段
-
-### 3. 建立防重护城河
-
-首次部署或重置 `file_tasks` 后，先执行：
+### 清理 Worker 扫描缓存
 
 ```bash
-python init_sync.py
+rm -f baicai-work/runtime/scanner_cache.db
 ```
 
-成功后会输出历史同步摘要。
+## 公开仓库注意事项
 
-执行 `init_sync.py` 前请确认：
+公开仓库只能提交模板和代码，不应提交：
 
-- `WORKER_NODE_NAME=Init_Scanner`
-- 不要使用任何真实 Worker 节点名，否则会覆盖 `worker_registry` 中真实节点的注册地址
+- `.env`
+- `baicai-work/.env`
+- `rclone.conf`
+- 数据库备份
+- 生产日志
+- 媒体路径清单
+- Worker 本地缓存
 
-### 4. 清理 Worker 扫描缓存
-
-如果你重置过 Center 数据库，必须在每个 Worker 节点执行：
-
-```bash
-rm -f /opt/baicai-worker/scanner_cache.db
-```
-
-否则 Worker 会误以为历史文件已经上报过。
-
-## 运行测试
-
-建议在本目录使用虚拟环境：
-
-```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r center_node/requirements.txt
-pip install -r worker_node/requirements.txt
-pip install coverage pytest-cov
-```
-
-全量回归命令：
-
-```bash
-env API_TOKEN=test-token \
-    DB_HOST=test-db-host \
-    DB_USER=test-db-user \
-    DB_PASSWORD=test-db-password \
-    DB_NAME=test-db-name \
-    CENTER_API=http://127.0.0.1:8080/api/report_files \
-    WORKER_NODE_NAME=Init_Scanner \
-    WORKER_API_URL=http://127.0.0.1:8001/task/upload \
-    CENTER_URL=http://127.0.0.1:8080 \
-    TARGET_REMOTE_DIR='your-target-dir' \
-    RCLONE_REMOTE_ACCOUNT=baicai-big \
-    TARGET_DIR='your-target-dir' \
-    ./.venv/bin/pytest -ra \
-    --junit-xml=test-reports/junit-full.xml \
-    --cov=center_node \
-    --cov=worker_node \
-    --cov-report=term-missing:skip-covered \
-    --cov-report=xml:test-reports/coverage-full.xml \
-    --cov-report=json:test-reports/coverage-full.json
-```
-
-当前测试基线：
-
-- `41 passed`
-- 总覆盖率 `88%`
-- 已覆盖 `Center`、`Worker`、`Scanner`、`InitSync`
-- 已覆盖多 Worker 分发与 Worker 本地 `rclone` 往返链路
-
-报告位置：
-
-- `test-reports/junit-full.xml`
-- `test-reports/coverage-full.xml`
-- `test-reports/coverage-full.json`
-
-## 关键环境变量
-
-### Center
-
-- `API_TOKEN`
-- `DB_HOST`
-- `DB_USER`
-- `DB_PASSWORD`
-- `DB_NAME`
-- `WORKER_API_URL_MAP`
-- `MAX_FILES_PER_REQUEST`
-- `MAX_SUCCESSFUL_FILES`
-- `MAX_MISSING_FILES`
-- `MAX_CLEANER_FILES_PER_REQUEST`
-- `CLEANER_IDLE_MINUTES`
-- `ACCOUNT_DISPATCH_LEASE_MINUTES`
-- `QUOTA_BLOCK_HOURS`
-
-### Worker
-
-- `CENTER_URL`
-- `TARGET_REMOTE_DIR`
-- `ALLOWED_BASE_DIRS`
-
-### Scanner
-
-- `CENTER_API`
-- `WORKER_NODE_NAME`
-- `WORKER_API_URL`
-- `CACHE_DB_PATH`
-- `SCANNER_CHUNK_SIZE`
-- `LINKS_DELAY_HOURS`
-- `RCLONE_CACHE_DELAY_HOURS`
-
-### Init Sync
-
-- `RCLONE_REMOTE_ACCOUNT`
-- `TARGET_DIR`
-- `INIT_SYNC_CHUNK_SIZE`
-
-## 已完成的关键整改
-
-- 配置从硬编码迁移到环境变量读取
-- Worker 上报和 Center 派发均增加 HTTP 失败显式处理
-- `uploading` 心跳可刷新节点活跃时间
-- 0 文件命中不再误判为成功，改为 `not_found`
-- Worker 路径增加越界防护
-- Scanner 增加异常日志和统计摘要
-- 历史同步改为流式分块提交
-- 清理条件改为“上传活跃时绝不清、全组 quota 耗尽立即清、否则空闲后再清”
-- 账号锁已拆分为调度锁和 quota 封禁锁
-- `Worker` 上传命令已启用 `rclone --drive-stop-on-upload-limit`
-- 一旦 uploader 里的 `rclone` 结束当前任务并以非零退出码返回，`Worker` 会上报 `403_quota`
-- Center 收到 `403_quota` 后会将该账号写入 `quota_blocked_until` 封禁 24 小时，并把剩余任务回退给新账号继续
-- `403_quota` / `credential_invalid` 回执都会立即触发一次 uploader 重调度，不必等待 60 秒巡检
-- Uploader 不再产出 `retry_later`，也不再基于日志里的限流关键词或“无有效速度”单独触发 `403_quota`
-- Uploader 与 Cleaner 现在都只保留标准输出日志，不再额外双写本地明细日志
-- 现在 uploader 里只要 `rclone` 以非零退出码结束当前任务，就会导致账号切换和 24 小时封禁
-- 增加回归测试覆盖 `main.py`、`worker.py`、`scanner.py`、`init_sync.py`
-- 增加多 Worker 分发测试和 Worker 真实 `rclone` 往返测试
-
-## 注意事项
-
-- 若后续继续做大改，请先在独立测试副本完成联调，再回灌当前运行目录
-- 若 `WORKER_API_URL_MAP` 非空，则 Center 只接受白名单中的 `worker_node`
-- `force_all=True` 只能绕过“策略等待”，不能绕过“同组仍在上传”的安全挡板
-- 账号组的判定规则依赖命名约定：默认取账号名中 `@` 之前的前缀作为组名，例如 `baicai_1@1 -> baicai_1`
-- 生产切换前至少要完成一次真实测试库迁移验证和一次双 Worker 联调
+这些内容已在 [.gitignore](../.gitignore) 中排除。
