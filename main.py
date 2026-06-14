@@ -2,14 +2,14 @@ import json
 import logging
 import os
 import threading
+from typing import Any, List, Literal, Optional
 from contextlib import asynccontextmanager
-from typing import List, Literal
 
 import httpx
 import pymysql
 from apscheduler.schedulers.background import BackgroundScheduler
 from dbutils.pooled_db import PooledDB
-from fastapi import Depends, FastAPI, HTTPException, Security
+from fastapi import Depends, FastAPI, HTTPException, Query, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, field_validator
 
@@ -100,6 +100,7 @@ def get_db_pool():
                 database=DB_NAME,
                 cursorclass=pymysql.cursors.DictCursor,
                 autocommit=True,
+                init_command="SET time_zone = '+00:00'",
             )
     return _db_pool
 
@@ -129,10 +130,25 @@ def resolve_worker_api_url(worker_node: str, reported_api_url: str) -> str:
     return reported_api_url
 
 
+class ReportFileItem(BaseModel):
+    path: str = Field(min_length=1, max_length=1024)
+    size_bytes: Optional[int] = Field(default=None, ge=0)
+
+    @field_validator("path")
+    @classmethod
+    def validate_path(cls, value: str) -> str:
+        clean_path = value.strip()
+        if not clean_path:
+            raise ValueError("files 中不能出现空路径")
+        if "\x00" in clean_path or len(clean_path) > 1024:
+            raise ValueError("files 中存在非法路径")
+        return clean_path
+
+
 class ReportFilesRequest(BaseModel):
     worker_node: str = Field(min_length=1, max_length=128)
     worker_api_url: str = Field(min_length=8, max_length=255)
-    files: List[str] = Field(default_factory=list)
+    files: List[ReportFileItem] = Field(default_factory=list)
     is_history_sync: bool = False
     upload_method: Literal["copy", "move"] = "move"
 
@@ -149,22 +165,25 @@ class ReportFilesRequest(BaseModel):
     def validate_reported_api_url(cls, value: str) -> str:
         return validate_api_url(value.strip())
 
-    @field_validator("files")
+    @field_validator("files", mode="before")
     @classmethod
-    def validate_files(cls, value: List[str]) -> List[str]:
+    def normalize_files(cls, value: Any) -> List[dict[str, Any]]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError("files 必须是数组")
         if len(value) > MAX_FILES_PER_REQUEST:
             raise ValueError(f"单次最多允许上报 {MAX_FILES_PER_REQUEST} 个文件")
 
         normalized_files = []
-        for file_path in value:
-            if not isinstance(file_path, str):
-                raise ValueError("files 必须全部为字符串")
-            clean_path = file_path.strip()
-            if not clean_path:
-                raise ValueError("files 中不能出现空路径")
-            if "\x00" in clean_path or len(clean_path) > 1024:
-                raise ValueError("files 中存在非法路径")
-            normalized_files.append(clean_path)
+        for item in value:
+            if isinstance(item, str):
+                normalized_files.append({"path": item, "size_bytes": None})
+            elif isinstance(item, dict):
+                path = item.get("path", item.get("file_path"))
+                normalized_files.append({"path": path, "size_bytes": item.get("size_bytes")})
+            else:
+                raise ValueError("files 必须全部为字符串或文件对象")
         return normalized_files
 
 
@@ -254,6 +273,39 @@ def set_account_dispatch_cooldown(cursor, account_name: str, minutes: int):
     )
 
 
+def refresh_uploader_heartbeat(cursor, account_name: str) -> int:
+    cursor.execute(
+        """
+        UPDATE file_tasks
+        SET status='uploading', updated_at=UTC_TIMESTAMP()
+        WHERE account_used=%s AND status='pending'
+        """,
+        (account_name,),
+    )
+    recovered_pending = cursor.rowcount if isinstance(cursor.rowcount, int) else 0
+
+    cursor.execute(
+        """
+        UPDATE file_tasks
+        SET updated_at = UTC_TIMESTAMP()
+        WHERE account_used=%s AND status='uploading'
+        """,
+        (account_name,),
+    )
+
+    cursor.execute(
+        """
+        UPDATE drive_accounts
+        SET dispatch_locked_until = DATE_ADD(UTC_TIMESTAMP(), INTERVAL %s MINUTE)
+        WHERE account_name=%s
+          AND role='uploader'
+          AND is_active=1
+        """,
+        (ACCOUNT_DISPATCH_LEASE_MINUTES, account_name),
+    )
+    return recovered_pending
+
+
 def trigger_dispatch_uploader_tasks_async(reason: str):
     _dispatch_trigger_pending.set()
 
@@ -279,7 +331,7 @@ def update_tasks_by_account_and_files(cursor, account_name: str, current_status:
         return
     format_strings = ",".join(["%s"] * len(file_paths))
     cursor.execute(
-        f"UPDATE file_tasks SET status=%s, account_used=NULL "
+        f"UPDATE file_tasks SET status=%s, account_used=NULL, updated_at=UTC_TIMESTAMP() "
         f"WHERE account_used=%s AND status=%s AND file_path IN ({format_strings})",
         [target_status, account_name, current_status] + file_paths,
     )
@@ -295,7 +347,8 @@ def update_cleaner_tasks_by_files(cursor, cleaner_account: str, file_paths: List
             f"""
             UPDATE file_tasks ft
             JOIN drive_accounts da ON ft.account_used = da.account_name
-            SET ft.status = %s
+            SET ft.status = %s,
+                ft.updated_at = UTC_TIMESTAMP()
             WHERE ft.status = 'staged'
               AND da.cleaner_mapping = %s
               AND ft.file_path IN ({format_strings})
@@ -304,15 +357,85 @@ def update_cleaner_tasks_by_files(cursor, cleaner_account: str, file_paths: List
         )
 
 
+def insert_upload_usage_events_for_files(cursor, account_name: str, file_paths: List[str]):
+    if not file_paths:
+        return
+    for start in range(0, len(file_paths), MAX_SUCCESSFUL_FILES):
+        chunk = file_paths[start:start + MAX_SUCCESSFUL_FILES]
+        format_strings = ",".join(["%s"] * len(chunk))
+        cursor.execute(
+            f"""
+            INSERT IGNORE INTO account_upload_events
+                (account_name, file_task_id, size_bytes, uploaded_at)
+            SELECT %s, id, COALESCE(size_bytes, 0), UTC_TIMESTAMP()
+            FROM file_tasks
+            WHERE account_used=%s
+              AND status='uploading'
+              AND file_path IN ({format_strings})
+            """,
+            [account_name, account_name] + chunk,
+        )
+
+
+def insert_upload_usage_events_for_account(cursor, account_name: str):
+    cursor.execute(
+        """
+        INSERT IGNORE INTO account_upload_events
+            (account_name, file_task_id, size_bytes, uploaded_at)
+        SELECT %s, id, COALESCE(size_bytes, 0), UTC_TIMESTAMP()
+        FROM file_tasks
+        WHERE account_used=%s
+          AND status='uploading'
+        """,
+        (account_name, account_name),
+    )
+
+
+def mark_successful_uploads_by_files(cursor, account_name: str, target_status: str, file_paths: List[str]):
+    if not file_paths:
+        return
+    insert_upload_usage_events_for_files(cursor, account_name, file_paths)
+    for start in range(0, len(file_paths), MAX_SUCCESSFUL_FILES):
+        chunk = file_paths[start:start + MAX_SUCCESSFUL_FILES]
+        format_strings = ",".join(["%s"] * len(chunk))
+        cursor.execute(
+            f"""
+            UPDATE file_tasks
+            SET status=%s,
+                updated_at=UTC_TIMESTAMP()
+            WHERE account_used=%s
+              AND status='uploading'
+              AND file_path IN ({format_strings})
+            """,
+            [target_status, account_name] + chunk,
+        )
+
+
+def mark_all_uploading_tasks_success(cursor, account_name: str, target_status: str):
+    insert_upload_usage_events_for_account(cursor, account_name)
+    cursor.execute(
+        "UPDATE file_tasks SET status=%s, updated_at=UTC_TIMESTAMP() WHERE account_used=%s AND status='uploading'",
+        (target_status, account_name),
+    )
+
+
 def group_has_active_uploads(cursor, group_prefix: str) -> bool:
     cursor.execute(
         """
         SELECT 1 AS has_uploading
         FROM file_tasks
         WHERE status='uploading' AND account_used LIKE %s
+        UNION
+        SELECT 1 AS has_uploading
+        FROM drive_accounts
+        WHERE role='uploader'
+          AND is_active=1
+          AND account_name LIKE %s
+          AND dispatch_locked_until IS NOT NULL
+          AND dispatch_locked_until > UTC_TIMESTAMP()
         LIMIT 1
         """,
-        (f"{group_prefix}@%",),
+        (f"{group_prefix}@%", f"{group_prefix}@%"),
     )
     return cursor.fetchone() is not None
 
@@ -357,12 +480,12 @@ def get_group_quota_exhaustion(cursor, group_prefix: str) -> tuple[bool, int, in
 def revert_uploading_tasks(cursor, account_name: str, clear_account_used: bool) -> int:
     if clear_account_used:
         cursor.execute(
-            "UPDATE file_tasks SET status='pending', account_used=NULL WHERE account_used=%s AND status='uploading'",
+            "UPDATE file_tasks SET status='pending', account_used=NULL, updated_at=UTC_TIMESTAMP() WHERE account_used=%s AND status='uploading'",
             (account_name,),
         )
     else:
         cursor.execute(
-            "UPDATE file_tasks SET status='pending' WHERE account_used=%s AND status='uploading'",
+            "UPDATE file_tasks SET status='pending', updated_at=UTC_TIMESTAMP() WHERE account_used=%s AND status='uploading'",
             (account_name,),
         )
     return cursor.rowcount
@@ -370,7 +493,7 @@ def revert_uploading_tasks(cursor, account_name: str, clear_account_used: bool) 
 
 def clear_pending_account_preference(cursor, account_name: str) -> int:
     cursor.execute(
-        "UPDATE file_tasks SET account_used=NULL WHERE status='pending' AND account_used=%s",
+        "UPDATE file_tasks SET account_used=NULL, updated_at=UTC_TIMESTAMP() WHERE status='pending' AND account_used=%s",
         (account_name,),
     )
     return cursor.rowcount
@@ -381,7 +504,8 @@ def clear_unavailable_pending_account_preferences(cursor) -> int:
         """
         UPDATE file_tasks ft
         JOIN drive_accounts da ON da.account_name = ft.account_used
-        SET ft.account_used = NULL
+        SET ft.account_used = NULL,
+            ft.updated_at = UTC_TIMESTAMP()
         WHERE ft.status = 'pending'
           AND ft.account_used IS NOT NULL
           AND (
@@ -445,7 +569,8 @@ def release_stale_uploading_tasks(cursor) -> int:
         cursor.execute(
             """
             UPDATE file_tasks
-            SET status='pending'
+            SET status='pending',
+                updated_at=UTC_TIMESTAMP()
             WHERE status='uploading'
               AND account_used=%s
               AND worker_node=%s
@@ -492,7 +617,10 @@ def dispatch_uploader_tasks():
                     (dead_name,),
                 )
                 locked_accounts = [row["account_used"] for row in cursor.fetchall()]
-                cursor.execute("UPDATE file_tasks SET status='pending' WHERE status='uploading' AND worker_node=%s", (dead_name,))
+                cursor.execute(
+                    "UPDATE file_tasks SET status='pending', updated_at=UTC_TIMESTAMP() WHERE status='uploading' AND worker_node=%s",
+                    (dead_name,),
+                )
                 reverted_count = cursor.rowcount
                 for account_name in locked_accounts:
                     release_account_lock(cursor, account_name)
@@ -544,6 +672,14 @@ def dispatch_uploader_tasks():
                         AND (dispatch_locked_until IS NULL OR dispatch_locked_until < UTC_TIMESTAMP())
                         AND (dispatch_cooldown_until IS NULL OR dispatch_cooldown_until < UTC_TIMESTAMP())
                         AND (quota_blocked_until IS NULL OR quota_blocked_until < UTC_TIMESTAMP())
+                        AND NOT EXISTS (
+                            SELECT 1
+                            FROM drive_accounts cleaner
+                            WHERE cleaner.account_name = da.cleaner_mapping
+                              AND cleaner.role='cleaner'
+                              AND cleaner.dispatch_locked_until IS NOT NULL
+                              AND cleaner.dispatch_locked_until > UTC_TIMESTAMP()
+                        )
                         AND account_name NOT IN (
                             SELECT DISTINCT account_used FROM file_tasks 
                             WHERE status='uploading' AND account_used IS NOT NULL
@@ -593,8 +729,17 @@ def dispatch_uploader_tasks():
                     format_strings = ','.join(['%s'] * len(task_ids))
                     cursor.execute(
                         f"UPDATE file_tasks SET status='uploading', account_used=%s, updated_at=UTC_TIMESTAMP() "
-                        f"WHERE status='pending' AND id IN ({format_strings})",
-                        [account_name] + task_ids,
+                        f"WHERE status='pending' AND id IN ({format_strings}) "
+                        f"AND NOT EXISTS ("
+                        f"    SELECT 1 "
+                        f"    FROM drive_accounts da "
+                        f"    JOIN drive_accounts cleaner ON cleaner.account_name = da.cleaner_mapping "
+                        f"    WHERE da.account_name=%s "
+                        f"      AND cleaner.role='cleaner' "
+                        f"      AND cleaner.dispatch_locked_until IS NOT NULL "
+                        f"      AND cleaner.dispatch_locked_until > UTC_TIMESTAMP()"
+                        f")",
+                        [account_name] + task_ids + [account_name],
                     )
                     if cursor.rowcount != len(task_ids):
                         logger.warning("⚠️ 节点 [%s] 的候选任务在锁定前已被其他流程抢占，本轮跳过该批次。", node_name)
@@ -638,7 +783,19 @@ def dispatch_cleaner_tasks(force_all=False):
                     released_cleaner_locks,
                 )
 
-            cursor.execute("SELECT DISTINCT account_used, worker_node FROM file_tasks WHERE status='staged'")
+            cursor.execute(
+                """
+                SELECT
+                    account_used,
+                    worker_node,
+                    COUNT(*) AS staged_count,
+                    MIN(updated_at) AS oldest_staged
+                FROM file_tasks
+                WHERE status='staged'
+                GROUP BY account_used, worker_node
+                ORDER BY staged_count DESC, oldest_staged ASC
+                """
+            )
             staged_rows = cursor.fetchall()
             
             # 用于记录本次调度中已经派发过的清道夫账号，防止向多个节点重复派发同一个清道夫账号
@@ -796,9 +953,15 @@ def report_new_files(req: ReportFilesRequest):
             
             if req.files:
                 initial_status = "completed" if req.is_history_sync else "pending"
-                sql = "INSERT IGNORE INTO file_tasks (file_path, status, worker_node, upload_method) VALUES (%s, %s, %s, %s)"
+                sql = """
+                    INSERT INTO file_tasks
+                        (file_path, size_bytes, status, worker_node, upload_method)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        size_bytes = COALESCE(file_tasks.size_bytes, VALUES(size_bytes))
+                """
                 
-                values = [(f, initial_status, req.worker_node, req.upload_method) for f in req.files]
+                values = [(f.path, f.size_bytes, initial_status, req.worker_node, req.upload_method) for f in req.files]
                 chunk_size = 5000
                 for i in range(0, len(values), chunk_size):
                     chunk = values[i:i+chunk_size]
@@ -812,6 +975,115 @@ def report_new_files(req: ReportFilesRequest):
         return {"status": "success"}
     finally:
         db.close()
+
+
+@app.get("/api/upload_usage", dependencies=[Depends(verify_token)])
+def get_upload_usage(hours: int = Query(default=24, ge=1, le=24 * 14)):
+    db = get_db_connection()
+    try:
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    account_name,
+                    COUNT(*) AS uploaded_files,
+                    COALESCE(SUM(size_bytes), 0) AS uploaded_bytes,
+                    MAX(uploaded_at) AS last_uploaded_at_utc,
+                    MAX(DATE_ADD(uploaded_at, INTERVAL 8 HOUR)) AS last_uploaded_at_bj
+                FROM account_upload_events
+                WHERE uploaded_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL %s HOUR)
+                GROUP BY account_name
+                ORDER BY uploaded_bytes DESC, uploaded_files DESC, account_name ASC
+                """,
+                (hours,),
+            )
+            accounts = []
+            total_bytes = 0
+            total_files = 0
+            for row in cursor.fetchall():
+                uploaded_bytes = int(row["uploaded_bytes"] or 0)
+                uploaded_files = int(row["uploaded_files"] or 0)
+                total_bytes += uploaded_bytes
+                total_files += uploaded_files
+                accounts.append(
+                    {
+                        "account_name": row["account_name"],
+                        "uploaded_files": uploaded_files,
+                        "uploaded_bytes": uploaded_bytes,
+                        "uploaded_gib": round(uploaded_bytes / (1024 ** 3), 3),
+                        "last_uploaded_at_utc": row["last_uploaded_at_utc"],
+                        "last_uploaded_at_bj": row["last_uploaded_at_bj"],
+                    }
+                )
+
+        return {
+            "window_hours": hours,
+            "timezone": "Asia/Shanghai",
+            "total_files": total_files,
+            "total_bytes": total_bytes,
+            "total_gib": round(total_bytes / (1024 ** 3), 3),
+            "accounts": accounts,
+        }
+    finally:
+        db.close()
+
+
+@app.get("/api/upload_usage/daily", dependencies=[Depends(verify_token)])
+def get_daily_upload_usage(days: int = Query(default=7, ge=1, le=90)):
+    db = get_db_connection()
+    try:
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    DATE(DATE_ADD(uploaded_at, INTERVAL 8 HOUR)) AS upload_date_bj,
+                    account_name,
+                    COUNT(*) AS uploaded_files,
+                    COALESCE(SUM(size_bytes), 0) AS uploaded_bytes,
+                    MIN(uploaded_at) AS first_uploaded_at_utc,
+                    MAX(uploaded_at) AS last_uploaded_at_utc,
+                    MIN(DATE_ADD(uploaded_at, INTERVAL 8 HOUR)) AS first_uploaded_at_bj,
+                    MAX(DATE_ADD(uploaded_at, INTERVAL 8 HOUR)) AS last_uploaded_at_bj
+                FROM account_upload_events
+                WHERE uploaded_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL %s DAY)
+                GROUP BY upload_date_bj, account_name
+                ORDER BY upload_date_bj DESC, uploaded_bytes DESC, uploaded_files DESC, account_name ASC
+                """,
+                (days,),
+            )
+            rows = []
+            total_bytes = 0
+            total_files = 0
+            for row in cursor.fetchall():
+                uploaded_bytes = int(row["uploaded_bytes"] or 0)
+                uploaded_files = int(row["uploaded_files"] or 0)
+                total_bytes += uploaded_bytes
+                total_files += uploaded_files
+                rows.append(
+                    {
+                        "upload_date_bj": row["upload_date_bj"],
+                        "account_name": row["account_name"],
+                        "uploaded_files": uploaded_files,
+                        "uploaded_bytes": uploaded_bytes,
+                        "uploaded_gib": round(uploaded_bytes / (1024 ** 3), 3),
+                        "first_uploaded_at_utc": row["first_uploaded_at_utc"],
+                        "last_uploaded_at_utc": row["last_uploaded_at_utc"],
+                        "first_uploaded_at_bj": row["first_uploaded_at_bj"],
+                        "last_uploaded_at_bj": row["last_uploaded_at_bj"],
+                    }
+                )
+
+        return {
+            "days": days,
+            "timezone": "Asia/Shanghai",
+            "total_files": total_files,
+            "total_bytes": total_bytes,
+            "total_gib": round(total_bytes / (1024 ** 3), 3),
+            "rows": rows,
+        }
+    finally:
+        db.close()
+
 
 @app.post("/api/report_status", dependencies=[Depends(verify_token)])
 def receive_worker_report(req: ReportStatusRequest):
@@ -833,17 +1105,21 @@ def receive_worker_report(req: ReportStatusRequest):
                 if account_role == "cleaner":
                     update_cleaner_tasks_by_files(cursor, req.account_name, req.successful_files, "completed")
                 else:
-                    format_strings = ','.join(['%s'] * len(req.successful_files))
-                    cursor.execute(
-                        f"UPDATE file_tasks SET status=%s WHERE account_used=%s AND file_path IN ({format_strings})",
-                        [success_target_status, req.account_name] + req.successful_files,
-                    )
+                    mark_successful_uploads_by_files(cursor, req.account_name, success_target_status, req.successful_files)
 
             if req.missing_files:
                 logger.warning("⚠️ 账号 [%s] 上报 %s 个缺失文件，已标记为 not_found。", req.account_name, len(req.missing_files))
                 update_tasks_by_account_and_files(cursor, req.account_name, "uploading", "not_found", req.missing_files)
 
             if req.status == "uploading":
+                if account_role != "cleaner":
+                    recovered_pending = refresh_uploader_heartbeat(cursor, req.account_name)
+                    if recovered_pending > 0:
+                        logger.warning(
+                            "🩹 账号 [%s] 心跳恢复 %s 个已误回退的 pending 任务为 uploading。",
+                            req.account_name,
+                            recovered_pending,
+                        )
                 cursor.execute(
                     """
                     UPDATE worker_registry wr
@@ -902,7 +1178,7 @@ def receive_worker_report(req: ReportStatusRequest):
                 )
                 trigger_dispatch_now = True
             elif req.status == "completed":
-                cursor.execute(f"UPDATE file_tasks SET status='{success_target_status}' WHERE account_used=%s AND status='uploading'", (req.account_name,))
+                mark_all_uploading_tasks_success(cursor, req.account_name, success_target_status)
                 release_account_lock(cursor, req.account_name)
             elif req.status == "clean_success":
                 if account_role != "cleaner":
@@ -921,12 +1197,15 @@ def receive_worker_report(req: ReportStatusRequest):
                 logger.warning("⚠️ 账号 [%s] 上报 not_found，相关任务将退回 pending 等待人工排查。", req.account_name)
                 if req.missing_files:
                     cursor.execute(
-                        "UPDATE file_tasks SET status='pending', account_used=NULL "
+                        "UPDATE file_tasks SET status='pending', account_used=NULL, updated_at=UTC_TIMESTAMP() "
                         "WHERE account_used=%s AND status='uploading'",
                         (req.account_name,),
                     )
                 else:
-                    cursor.execute("UPDATE file_tasks SET status='not_found', account_used=NULL WHERE account_used=%s AND status='uploading'", (req.account_name,))
+                    cursor.execute(
+                        "UPDATE file_tasks SET status='not_found', account_used=NULL, updated_at=UTC_TIMESTAMP() WHERE account_used=%s AND status='uploading'",
+                        (req.account_name,),
+                    )
                 release_account_lock(cursor, req.account_name)
         if trigger_dispatch_now:
             trigger_dispatch_uploader_tasks_async(f"{req.status}:{req.account_name}")

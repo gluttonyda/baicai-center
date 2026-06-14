@@ -38,8 +38,8 @@ def test_flush_tasks_reports_and_persists_cache():
         with patch("scanner.httpx.post", return_value=mock_response):
             reported = scanner.flush_tasks(
                 [
-                    {"base_dir": "/data/links", "file_path": "movie/a.mkv"},
-                    {"base_dir": "/data/links", "file_path": "movie/b.mkv"},
+                    {"base_dir": "/data/links", "file_path": "movie/a.mkv", "size_bytes": 10},
+                    {"base_dir": "/data/links", "file_path": "movie/b.mkv", "size_bytes": 20},
                 ],
                 "move",
                 123.0,
@@ -143,5 +143,5 @@ def test_scan_and_report_uses_configured_scan_directories():
         ):
             scanner.scan_and_report()
 
-    assert any(payload["files"] == ["movie.txt"] for payload in reported_payloads)
+    assert any(payload["files"] == [{"path": "movie.txt", "size_bytes": 5}] for payload in reported_payloads)
     assert any(payload["upload_method"] == "copy" for payload in reported_payloads)

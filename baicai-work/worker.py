@@ -391,6 +391,14 @@ def run_cleaner(account_name: str, dest_name: str, requested_files: List[str]):
     )
     cleaned_files_seen: set[str] = set()
     pending_report_files: list[str] = []
+    requested_report_files = []
+    requested_files_seen: set[str] = set()
+    source_missing = False
+    for file_path in requested_files:
+        normalized_path = file_path.strip().replace("\\", "/")
+        if normalized_path and normalized_path not in requested_files_seen:
+            requested_files_seen.add(normalized_path)
+            requested_report_files.append(normalized_path)
     
     cmd = [
         "rclone", "move", f"{account_name}:{TARGET_REMOTE_DIR}", 
@@ -409,6 +417,9 @@ def run_cleaner(account_name: str, dest_name: str, requested_files: List[str]):
         with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True) as p:
             for line in p.stdout:
                 print(f"[CLEAN-{account_name}] {line.strip()}", flush=True)
+                normalized_line = line.lower()
+                if "directory not found" in normalized_line:
+                    source_missing = True
                 current_time = time.time()
                 if current_time - last_report_time > 300:
                     logger.info(f"💓 [CLEAN-{account_name}] 清理执行中... 汇报活跃状态防失联。")
@@ -425,7 +436,24 @@ def run_cleaner(account_name: str, dest_name: str, requested_files: List[str]):
                                 flush_cleaner_success_batch(account_name, "uploading", pending_report_files)
             p.wait()
             if p.returncode == 0:
-                flush_cleaner_success_batch(account_name, "clean_success", pending_report_files)
+                if pending_report_files:
+                    flush_cleaner_success_batch(account_name, "clean_success", pending_report_files)
+                elif requested_report_files:
+                    logger.warning(
+                        "🧹 [CLEAN-%s] rclone 成功但没有搬运明细，按大脑下发的 %s 个 staged 文件完成清理记录。",
+                        account_name,
+                        len(requested_report_files),
+                    )
+                    report_status(account_name, "clean_success", requested_report_files)
+                else:
+                    report_status(account_name, "clean_success")
+            elif source_missing and requested_report_files:
+                logger.warning(
+                    "🧹 [CLEAN-%s] 源目录不存在，按大脑下发的 %s 个 staged 文件清理旧记录。",
+                    account_name,
+                    len(requested_report_files),
+                )
+                report_status(account_name, "clean_success", requested_report_files)
             else:
                 flush_cleaner_success_batch(account_name, "failed", pending_report_files)
     except Exception as e:

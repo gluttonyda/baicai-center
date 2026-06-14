@@ -203,6 +203,34 @@ def test_run_cleaner_does_not_ignore_existing_destination_files():
     assert "--drive-use-trash=false" in cmd
 
 
+def test_run_cleaner_reports_requested_files_when_success_has_no_file_details():
+    process = MagicMock()
+    process.stdout = ["INFO  : There was nothing to transfer\n"]
+    process.returncode = 0
+    process.wait.return_value = 0
+    process.__enter__.return_value = process
+    process.__exit__.return_value = False
+
+    with patch("worker.subprocess.Popen", return_value=process), patch("worker.report_status") as mock_report_status, patch("worker.time.time", return_value=0):
+        worker.run_cleaner("baicai-1@1-3", "baicai-big", ["movie/a.mkv", "movie/a.mkv"])
+
+    mock_report_status.assert_called_once_with("baicai-1@1-3", "clean_success", ["movie/a.mkv"])
+
+
+def test_run_cleaner_clears_requested_files_when_source_directory_missing():
+    process = MagicMock()
+    process.stdout = ["ERROR : LongEmby-A: error reading source root directory: directory not found\n"]
+    process.returncode = 3
+    process.wait.return_value = 0
+    process.__enter__.return_value = process
+    process.__exit__.return_value = False
+
+    with patch("worker.subprocess.Popen", return_value=process), patch("worker.report_status") as mock_report_status, patch("worker.time.time", return_value=0):
+        worker.run_cleaner("baicai-1@1-3", "baicai-big", ["movie/a.mkv"])
+
+    mock_report_status.assert_called_once_with("baicai-1@1-3", "clean_success", ["movie/a.mkv"])
+
+
 def test_run_uploader_stops_next_directory_after_stop_on_upload_limit_exit():
     class FakeStdout:
         def __init__(self, lines):

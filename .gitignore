@@ -23,6 +23,7 @@ logs/
 runtime/
 scanner_cache.db
 failed_init_sync_chunks/
+tmp/
 
 # Backups and production data snapshots
 backups/

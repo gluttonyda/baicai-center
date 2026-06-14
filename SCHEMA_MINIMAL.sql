@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS drive_accounts (
 CREATE TABLE IF NOT EXISTS file_tasks (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     file_path VARCHAR(1024) NOT NULL,
+    size_bytes BIGINT UNSIGNED NULL,
     file_path_hash CHAR(64) AS (SHA2(file_path, 256)) STORED,
     status ENUM('pending', 'uploading', 'staged', 'completed', 'failed', 'not_found') NOT NULL,
     worker_node VARCHAR(128) NOT NULL,
@@ -50,5 +51,23 @@ CREATE TABLE IF NOT EXISTS file_tasks (
         ON UPDATE CASCADE,
     CONSTRAINT fk_file_tasks_account_used
         FOREIGN KEY (account_used) REFERENCES drive_accounts(account_name)
+        ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS account_upload_events (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    account_name VARCHAR(128) NOT NULL,
+    file_task_id BIGINT UNSIGNED NOT NULL,
+    size_bytes BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    uploaded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_account_upload_events_task (file_task_id),
+    KEY idx_account_upload_events_account_time (account_name, uploaded_at),
+    KEY idx_account_upload_events_uploaded_at (uploaded_at),
+    CONSTRAINT fk_account_upload_events_account
+        FOREIGN KEY (account_name) REFERENCES drive_accounts(account_name)
+        ON UPDATE CASCADE,
+    CONSTRAINT fk_account_upload_events_file_task
+        FOREIGN KEY (file_task_id) REFERENCES file_tasks(id)
         ON UPDATE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

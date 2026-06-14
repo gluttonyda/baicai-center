@@ -77,6 +77,8 @@ Center 默认暴露：
 GET  /
 POST /api/report_files
 POST /api/report_status
+GET  /api/upload_usage
+GET  /api/upload_usage/daily
 ```
 
 ## 搬运流程
@@ -167,6 +169,7 @@ mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASSWORD" "$DB_NAME" < SCHEMA_MINIMAL.s
 
 ```bash
 mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASSWORD" "$DB_NAME" < MIGRATION_SPLIT_ACCOUNT_LOCKS.sql
+mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASSWORD" "$DB_NAME" < MIGRATION_UPLOAD_USAGE_STATS.sql
 ```
 
 ### 3. 建立历史防重复屏障

@@ -53,6 +53,7 @@ def test_report_status_completed_updates_tasks(mock_db):
     assert response.status_code == 200
     assert response.json() == {"status": "success"}
     sql_calls = [call[0][0] for call in mock_db.execute.call_args_list]
+    assert any("INSERT IGNORE INTO account_upload_events" in sql for sql in sql_calls)
     assert any("UPDATE file_tasks SET status=%s" in sql for sql in sql_calls)
 
 
@@ -67,6 +68,8 @@ def test_report_status_uploading_refreshes_worker_last_active(mock_db):
 
     assert response.status_code == 200
     sql_calls = [call[0][0] for call in mock_db.execute.call_args_list]
+    assert any("SET status='uploading', updated_at=UTC_TIMESTAMP()" in sql for sql in sql_calls)
+    assert any("SET dispatch_locked_until = DATE_ADD" in sql for sql in sql_calls)
     assert any("UPDATE worker_registry wr" in sql for sql in sql_calls)
     assert any("UPDATE file_tasks" in sql and "updated_at = UTC_TIMESTAMP()" in sql for sql in sql_calls)
 
@@ -99,7 +102,7 @@ def test_report_status_credential_invalid_disables_account(mock_db):
     sql_calls = [call[0][0] for call in mock_db.execute.call_args_list]
     assert any("SET is_active = 0" in sql and "dispatch_locked_until = NULL" in sql for sql in sql_calls)
     assert any("UPDATE file_tasks SET status='pending'" in sql for sql in sql_calls)
-    assert any("UPDATE file_tasks SET account_used=NULL WHERE status='pending' AND account_used=%s" in sql for sql in sql_calls)
+    assert any("UPDATE file_tasks SET account_used=NULL, updated_at=UTC_TIMESTAMP() WHERE status='pending' AND account_used=%s" in sql for sql in sql_calls)
 
 
 def test_report_files_uses_configured_worker_api_url(mock_db):
@@ -119,6 +122,31 @@ def test_report_files_uses_configured_worker_api_url(mock_db):
     insert_sql = mock_db.execute.call_args_list[0][0][0]
     assert "UTC_TIMESTAMP()" in insert_sql
     assert "NOW()" not in insert_sql
+
+
+def test_report_files_persists_file_sizes(mock_db):
+    payload = {
+        "worker_node": "worker-node-1",
+        "worker_api_url": "http://worker-node-1.example.com:8001/task/upload",
+        "files": [
+            {"path": "movie/sized.mkv", "size_bytes": 123},
+            "movie/legacy.mkv",
+        ],
+        "upload_method": "move",
+    }
+
+    response = client.post("/api/report_files", json=payload, headers=auth_headers())
+
+    assert response.status_code == 200
+    sql = mock_db.executemany.call_args[0][0]
+    values = mock_db.executemany.call_args[0][1]
+    assert "(file_path, size_bytes, status, worker_node, upload_method)" in sql
+    assert "ON DUPLICATE KEY UPDATE" in sql
+    assert "COALESCE(file_tasks.size_bytes, VALUES(size_bytes))" in sql
+    assert values == [
+        ("movie/sized.mkv", 123, "pending", "worker-node-1", "move"),
+        ("movie/legacy.mkv", None, "pending", "worker-node-1", "move"),
+    ]
 
 
 def test_report_status_rejects_unknown_status():
@@ -342,6 +370,38 @@ def test_dispatch_uploader_tasks_filters_dispatch_and_quota_locks():
     available_account_sql = next(sql for sql in sql_calls if "FROM drive_accounts da" in sql and "has_preferred_pending" in sql)
     assert "dispatch_locked_until IS NULL OR dispatch_locked_until < UTC_TIMESTAMP()" in available_account_sql
     assert "quota_blocked_until IS NULL OR quota_blocked_until < UTC_TIMESTAMP()" in available_account_sql
+    assert "cleaner.account_name = da.cleaner_mapping" in available_account_sql
+    assert "cleaner.role='cleaner'" in available_account_sql
+
+
+def test_dispatch_uploader_tasks_rechecks_cleaner_lock_when_marking_uploading():
+    mock_cursor = MagicMock()
+    mock_connection = MagicMock()
+    mock_connection.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_cursor.rowcount = 1
+
+    mock_cursor.fetchall.side_effect = [
+        [],
+        [],
+        [{"node_name": "worker-node-1", "api_url": "http://worker:8001/task/upload"}],
+        [{"account_name": "baicai_1@1"}],
+        [{"id": 1, "file_path": "movie/test1.mkv", "upload_method": "move"}],
+        [],
+    ]
+    mock_cursor.fetchone.side_effect = [
+        {"active_count": 0},
+    ]
+
+    mock_response = MagicMock()
+    mock_response.raise_for_status.return_value = None
+
+    with patch("main.get_db_connection", return_value=mock_connection), patch("main.httpx.post", return_value=mock_response):
+        main.dispatch_uploader_tasks()
+
+    sql_calls = [call[0][0] for call in mock_cursor.execute.call_args_list]
+    mark_uploading_sql = next(sql for sql in sql_calls if "UPDATE file_tasks SET status='uploading'" in sql)
+    assert "cleaner.account_name = da.cleaner_mapping" in mark_uploading_sql
+    assert "cleaner.dispatch_locked_until > UTC_TIMESTAMP()" in mark_uploading_sql
 
 
 def test_dispatch_uploader_tasks_prefers_original_account_pending_tasks():
@@ -570,7 +630,7 @@ def test_report_status_not_found_clears_account_used_when_requeueing_remaining_t
 
     assert response.status_code == 200
     sql_calls = [call[0][0] for call in mock_db.execute.call_args_list]
-    assert any("UPDATE file_tasks SET status='pending', account_used=NULL WHERE account_used=%s AND status='uploading'" in sql for sql in sql_calls)
+    assert any("UPDATE file_tasks SET status='pending', account_used=NULL, updated_at=UTC_TIMESTAMP()" in sql for sql in sql_calls)
 
 
 def test_report_status_rejects_retry_later_status():
@@ -599,7 +659,7 @@ def test_report_status_failed_keeps_original_account_preference(mock_db):
 
     assert response.status_code == 200
     sql_calls = [call[0][0] for call in mock_db.execute.call_args_list]
-    assert any("UPDATE file_tasks SET status='pending' WHERE account_used=%s AND status='uploading'" in sql for sql in sql_calls)
+    assert any("UPDATE file_tasks SET status='pending', updated_at=UTC_TIMESTAMP() WHERE account_used=%s AND status='uploading'" in sql for sql in sql_calls)
     assert not any("UPDATE file_tasks SET status='pending', account_used=NULL WHERE account_used=%s AND status='uploading'" in sql for sql in sql_calls)
 
 
@@ -687,3 +747,63 @@ def test_update_cleaner_tasks_by_files_batches_large_updates():
     second_params = cursor.execute.call_args_list[1][0][1]
     assert first_params == ["completed", "baicai-1@1-3", "movie/a.mkv", "movie/b.mkv"]
     assert second_params == ["completed", "baicai-1@1-3", "movie/c.mkv"]
+
+
+def test_get_upload_usage_returns_beijing_time_fields(mock_db):
+    mock_db.fetchall.return_value = [
+        {
+            "account_name": "baicai_1@1",
+            "uploaded_files": 2,
+            "uploaded_bytes": 2 * 1024 ** 3,
+            "last_uploaded_at_utc": "2026-06-10 01:00:00",
+            "last_uploaded_at_bj": "2026-06-10 09:00:00",
+        }
+    ]
+
+    response = client.get("/api/upload_usage?hours=24", headers=auth_headers())
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "window_hours": 24,
+        "timezone": "Asia/Shanghai",
+        "total_files": 2,
+        "total_bytes": 2 * 1024 ** 3,
+        "total_gib": 2.0,
+        "accounts": [
+            {
+                "account_name": "baicai_1@1",
+                "uploaded_files": 2,
+                "uploaded_bytes": 2 * 1024 ** 3,
+                "uploaded_gib": 2.0,
+                "last_uploaded_at_utc": "2026-06-10 01:00:00",
+                "last_uploaded_at_bj": "2026-06-10 09:00:00",
+            }
+        ],
+    }
+    sql = mock_db.execute.call_args[0][0]
+    assert "DATE_ADD(uploaded_at, INTERVAL 8 HOUR)" in sql
+
+
+def test_get_daily_upload_usage_groups_by_beijing_date(mock_db):
+    mock_db.fetchall.return_value = [
+        {
+            "upload_date_bj": "2026-06-10",
+            "account_name": "baicai_2@1",
+            "uploaded_files": 1,
+            "uploaded_bytes": 1024 ** 3,
+            "first_uploaded_at_utc": "2026-06-09 18:00:00",
+            "last_uploaded_at_utc": "2026-06-09 18:00:00",
+            "first_uploaded_at_bj": "2026-06-10 02:00:00",
+            "last_uploaded_at_bj": "2026-06-10 02:00:00",
+        }
+    ]
+
+    response = client.get("/api/upload_usage/daily?days=3", headers=auth_headers())
+
+    assert response.status_code == 200
+    assert response.json()["days"] == 3
+    assert response.json()["timezone"] == "Asia/Shanghai"
+    assert response.json()["total_gib"] == 1.0
+    assert response.json()["rows"][0]["upload_date_bj"] == "2026-06-10"
+    sql = mock_db.execute.call_args[0][0]
+    assert "GROUP BY upload_date_bj, account_name" in sql

@@ -163,7 +163,11 @@ def flush_tasks(file_list, method, current_time, conn, cursor):
         chunk = file_list[i:i + SCANNER_CHUNK_SIZE]
         payload = {
             "worker_node": WORKER_NODE_NAME, "worker_api_url": WORKER_API_URL,
-            "upload_method": method, "files": [item["file_path"] for item in chunk]
+            "upload_method": method,
+            "files": [
+                {"path": item["file_path"], "size_bytes": item.get("size_bytes")}
+                for item in chunk
+            ],
         }
         try:
             res = httpx.post(CENTER_API, json=payload, headers={"Authorization": f"Bearer {API_TOKEN}"}, timeout=60.0)
@@ -261,7 +265,7 @@ def scan_and_report():
                             scan_metrics["waiting_stable"] += 1
                             continue
 
-                        pending_tasks[method].append({"base_dir": base_dir, "file_path": rel_path})
+                        pending_tasks[method].append({"base_dir": base_dir, "file_path": rel_path, "size_bytes": stat.st_size})
 
                         if len(pending_tasks[method]) >= 1000:
                             flushed = flush_tasks(pending_tasks[method], method, current_time, conn, cursor)
