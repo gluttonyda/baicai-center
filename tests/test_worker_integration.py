@@ -7,8 +7,11 @@ import tempfile
 from fastapi.testclient import TestClient
 
 os.environ.setdefault("API_TOKEN", "test-token")
+os.environ.setdefault("NODE_TOKEN", "test-node-token-at-least-32-characters")
+os.environ.setdefault("ALLOW_LEGACY_BEARER_AUTH", "true")
 os.environ.setdefault("CENTER_URL", "http://127.0.0.1:8080")
 os.environ.setdefault("TARGET_REMOTE_DIR", "your-target-dir")
+os.environ.setdefault("WORKER_NODE_NAME", "worker-node-1")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -48,6 +51,7 @@ def test_receive_task_upload_routes_to_background_worker():
         "task_type": "upload",
         "upload_method": "move",
         "account_name": "baicai_1@1",
+        "remote_dir": "LongEmby-B",
         "files": ["movie/test.mkv"],
     }
 
@@ -55,8 +59,12 @@ def test_receive_task_upload_routes_to_background_worker():
         response = client.post("/task/upload", json=payload, headers=auth_headers())
 
     assert response.status_code == 200
-    assert response.json() == {"status": "Accepted", "mode": "move"}
-    mock_run_uploader.assert_called_once_with("baicai_1@1", ["movie/test.mkv"], "move")
+    assert response.json()["status"] == "Accepted"
+    assert response.json()["mode"] == "move"
+    assert response.json()["dispatch_id"].startswith("legacy-")
+    mock_run_uploader.assert_called_once_with(
+        "baicai_1@1", ["movie/test.mkv"], "move", None, None, None, "LongEmby-B"
+    )
 
 
 def test_receive_task_clean_routes_to_background_worker():
@@ -64,7 +72,8 @@ def test_receive_task_clean_routes_to_background_worker():
         "task_type": "clean",
         "upload_method": "move",
         "account_name": "baicai-1@1-3",
-        "dest_name": "baicai-big",
+        "dest_name": "baicai-big2",
+        "remote_dir": "LongEmby-B",
         "files": ["movie/test.mkv"],
     }
 
@@ -72,7 +81,9 @@ def test_receive_task_clean_routes_to_background_worker():
         response = client.post("/task/upload", json=payload, headers=auth_headers())
 
     assert response.status_code == 200
-    mock_run_cleaner.assert_called_once_with("baicai-1@1-3", "baicai-big", ["movie/test.mkv"])
+    mock_run_cleaner.assert_called_once_with(
+        "baicai-1@1-3", "baicai-big2", ["movie/test.mkv"], "LongEmby-B"
+    )
 
 
 def test_worker_rclone_upload_and_clean_round_trip():
@@ -107,7 +118,10 @@ def test_worker_rclone_upload_and_clean_round_trip():
             def capture_clean(account, status, successful_files=None, missing_files=None):
                 clean_reports.append((account, status, successful_files or [], missing_files or []))
 
-            with patch("worker.report_status", side_effect=capture_clean):
+            with patch(
+                "worker.resolve_cleaner_destination_remote",
+                return_value=f"baicai-big:{worker.TARGET_REMOTE_DIR}",
+            ), patch("worker.report_status", side_effect=capture_clean):
                 worker.run_cleaner("baicai-1@1-3", "baicai-big", ["movie/sample.txt"])
 
             dest_file = dest_root / worker.TARGET_REMOTE_DIR / "movie" / "sample.txt"

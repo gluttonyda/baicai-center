@@ -8,6 +8,7 @@
 *.p12
 *.pfx
 rclone.conf
+hosts.yml
 
 # Python/runtime artifacts
 .venv/
@@ -20,8 +21,19 @@ __pycache__/
 # Logs, caches, and generated runtime data
 *.log
 logs/
+rclone-logs/
 runtime/
 scanner_cache.db
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+baicai-work/links/
+baicai-work/cache-links/
+baicai-work/rclone-cache/
 failed_init_sync_chunks/
 tmp/
 
@@ -31,6 +43,8 @@ db-backups/
 *.sql.gz
 *.tar.gz
 /IMPORT_DRIVE_ACCOUNTS.sql
+# 部署专用的一次性账号迁移包含现场开关策略，不属于通用建表迁移。
+/MIGRATION_BIG2_ROUTING.sql
 
 # Local audit/dedupe outputs that may include private media paths
 dedupe_*.log

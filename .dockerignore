@@ -12,3 +12,15 @@ failed_init_sync_chunks/
 duplicate_*.txt
 dedupe_*.log
 docs/cleanup-logs/
+.git/
+tmp/
+rclone-logs/
+**/runtime/
+*.db
+*.db-wal
+*.db-shm
+rclone.conf
+*.key
+*.pem
+IMPORT_DRIVE_ACCOUNTS.sql
+MIGRATION_BIG2_ROUTING.sql

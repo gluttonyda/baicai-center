@@ -1,6 +1,8 @@
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+from datetime import datetime, timedelta, timezone
 import httpx
+import json
 import os
 import sys
 import threading
@@ -9,6 +11,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 os.environ.setdefault("API_TOKEN", "test-token")
+os.environ.setdefault("ALLOW_LEGACY_NODE_AUTH", "true")
+os.environ.setdefault("ALLOW_LEGACY_UNLEASED_REPORTS", "true")
 os.environ.setdefault("DB_HOST", "test-db-host")
 os.environ.setdefault("DB_USER", "test-db-user")
 os.environ.setdefault("DB_PASSWORD", "test-db-password")
@@ -28,6 +32,11 @@ def mock_db():
         mock_cursor = MagicMock()
         mock_connection = MagicMock()
         mock_connection.cursor.return_value.__enter__.return_value = mock_cursor
+        mock_cursor.fetchone.return_value = {
+            "role": "uploader",
+            "current_dispatch_id": None,
+            "current_worker_node": None,
+        }
         mock_conn.return_value = mock_connection
         yield mock_cursor
 
@@ -36,9 +45,73 @@ def auth_headers():
     return {"Authorization": f"Bearer {API_TOKEN}"}
 
 
+@pytest.fixture(autouse=True)
+def fixed_upload_limit_for_dispatch_tests(request):
+    if "dispatch_uploader_tasks" not in request.node.name:
+        yield
+        return
+
+    with patch.object(main, "current_upload_concurrency_limit", return_value=2):
+        yield
+
+
+def test_current_upload_concurrency_limit_switches_by_beijing_hour():
+    night = datetime(2026, 6, 21, 1, 0, 0, tzinfo=timezone(timedelta(hours=8)))
+    day = datetime(2026, 6, 21, 10, 0, 0, tzinfo=timezone(timedelta(hours=8)))
+
+    assert main.current_upload_concurrency_limit(night) == 3
+    assert main.current_upload_concurrency_limit(day) == 2
+
+
+def test_upload_remote_dir_routes_legacy_and_new_final_drives():
+    assert main.upload_remote_dir_for_account("baicai_big@1") == "LongEmby-A"
+    assert main.upload_remote_dir_for_account("baicai_big2@1") == "LongEmby-B"
+    assert main.upload_remote_dir_for_account("baicai_2@1") == "LongEmby-B"
+    assert main.is_direct_upload_account("baicai_big@1") is True
+    assert main.is_direct_upload_account("baicai_big2@1") is True
+    assert main.is_direct_upload_account("baicai_2@1") is False
+
+
 def test_unauthorized_access():
     response = client.post("/api/report_status", json={"account_name": "test", "status": "completed"})
-    assert response.status_code == 403
+    assert response.status_code == 401
+
+
+def test_report_status_preserves_leading_and_trailing_spaces():
+    request = main.ReportStatusRequest(
+        account_name="baicai_1@1",
+        status="completed",
+        successful_files=[" movie.mkv "],
+        missing_files=[" missing.mkv "],
+    )
+
+    assert request.successful_files == [" movie.mkv "]
+    assert request.missing_files == [" missing.mkv "]
+
+
+def test_health_ready_queries_database_and_closes_connection():
+    connection = MagicMock()
+    cursor = connection.cursor.return_value.__enter__.return_value
+
+    with patch("main.get_db_connection", return_value=connection):
+        response = client.get("/health/ready")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ready"}
+    assert cursor.execute.call_count == 4
+    assert "source_mtime" in cursor.execute.call_args_list[0].args[0]
+    assert "protocol_version" in cursor.execute.call_args_list[1].args[0]
+    assert "current_dispatch_id" in cursor.execute.call_args_list[2].args[0]
+    assert "dispatch_id" in cursor.execute.call_args_list[3].args[0]
+    connection.close.assert_called_once_with()
+
+
+def test_health_ready_returns_503_when_database_is_unavailable():
+    with patch("main.get_db_connection", side_effect=RuntimeError("database unavailable")):
+        response = client.get("/health/ready")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Database unavailable"}
 
 
 def test_report_status_completed_updates_tasks(mock_db):
@@ -118,7 +191,7 @@ def test_report_files_uses_configured_worker_api_url(mock_db):
 
     assert response.status_code == 200
     insert_args = mock_db.execute.call_args_list[0][0][1]
-    assert insert_args == ("worker-node-1", "http://worker-node-1.example.com:8001/task/upload")
+    assert insert_args == ("worker-node-1", "http://worker-node-1.example.com:8001/task/upload", 1)
     insert_sql = mock_db.execute.call_args_list[0][0][0]
     assert "UTC_TIMESTAMP()" in insert_sql
     assert "NOW()" not in insert_sql
@@ -129,7 +202,7 @@ def test_report_files_persists_file_sizes(mock_db):
         "worker_node": "worker-node-1",
         "worker_api_url": "http://worker-node-1.example.com:8001/task/upload",
         "files": [
-            {"path": "movie/sized.mkv", "size_bytes": 123},
+            {"path": "movie/sized.mkv", "size_bytes": 123, "mtime": 456.5},
             "movie/legacy.mkv",
         ],
         "upload_method": "move",
@@ -140,12 +213,161 @@ def test_report_files_persists_file_sizes(mock_db):
     assert response.status_code == 200
     sql = mock_db.executemany.call_args[0][0]
     values = mock_db.executemany.call_args[0][1]
-    assert "(file_path, size_bytes, status, worker_node, upload_method)" in sql
+    assert "(file_path, source_base_dir, size_bytes, source_mtime, status, worker_node, upload_method)" in sql
     assert "ON DUPLICATE KEY UPDATE" in sql
     assert "COALESCE(file_tasks.size_bytes, VALUES(size_bytes))" in sql
+    assert "source_base_dir = CASE" in sql
+    assert "worker_node = CASE" in sql
+    assert "upload_method = CASE" in sql
+    assert "file_tasks.status = 'not_found'" in sql
     assert values == [
-        ("movie/sized.mkv", 123, "pending", "worker-node-1", "move"),
-        ("movie/legacy.mkv", None, "pending", "worker-node-1", "move"),
+        ("movie/sized.mkv", None, 123, 456.5, "pending", "worker-node-1", "move"),
+        ("movie/legacy.mkv", None, None, None, "pending", "worker-node-1", "move"),
+    ]
+
+
+def test_report_files_defers_fingerprint_change_retained_by_active_dispatch(mock_db):
+    mock_db.fetchall.return_value = [
+        {
+            "file_path": "movie/active.mkv",
+            "source_base_dir": "/cache/downloads",
+            "size_bytes": 100,
+            "source_mtime": 1000.0,
+        }
+    ]
+    payload = {
+        "worker_node": "worker-node-1",
+        "worker_api_url": "http://worker-node-1.example.com:8001/task/upload",
+        "files": [
+            {
+                "path": "movie/active.mkv",
+                "source_base_dir": "/cache/links",
+                "size_bytes": 200,
+                "mtime": 2000.0,
+            }
+        ],
+        "upload_method": "move",
+    }
+
+    response = client.post("/api/report_files", json=payload, headers=auth_headers())
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "success",
+        "deferred_files": ["movie/active.mkv"],
+    }
+
+
+def test_report_files_completed_fingerprint_change_can_requeue_and_root_can_refresh(mock_db):
+    mock_db.fetchall.return_value = [
+        {
+            "file_path": "movie/replaced.mkv",
+            "source_base_dir": "/cache/links",
+            "size_bytes": 200,
+            "source_mtime": 2000.0,
+        }
+    ]
+    payload = {
+        "worker_node": "worker-node-1",
+        "worker_api_url": "http://worker-node-1.example.com:8001/task/upload",
+        "files": [
+            {
+                "path": "movie/replaced.mkv",
+                "source_base_dir": "/cache/links",
+                "size_bytes": 200,
+                "mtime": 2000.0,
+            }
+        ],
+        "upload_method": "move",
+    }
+
+    response = client.post("/api/report_files", json=payload, headers=auth_headers())
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "success", "deferred_files": []}
+    upsert_sql = mock_db.executemany.call_args.args[0]
+    assert "file_tasks.status = 'completed'" in upsert_sql
+    assert "file_tasks.status IN ('pending', 'completed')" in upsert_sql
+    assert "WHEN file_tasks.status IN ('uploading', 'staged')" in upsert_sql
+    assert "file_tasks.source_mtime <> VALUES(source_mtime)" in upsert_sql
+    assert "file_tasks.size_bytes <> VALUES(size_bytes)" in upsert_sql
+
+
+def test_validate_dispatch_renews_only_matching_live_lease(mock_db):
+    mock_db.rowcount = 1
+    mock_db.fetchone.side_effect = [
+        {"id": 1},
+        {"active": 1},
+    ]
+    payload = {
+        "dispatch_id": "dispatch-lease-valid-1",
+        "account_name": "baicai_1@1",
+        "worker_node": "worker-node-1",
+    }
+
+    response = client.post("/api/dispatch/validate", json=payload, headers=auth_headers())
+
+    assert response.status_code == 200
+    assert response.json() == {"active": True}
+    sql_calls = [call.args for call in mock_db.execute.call_args_list]
+    task_lock_sql, task_lock_params = next(
+        (sql, params) for sql, params in sql_calls if "FROM file_tasks" in sql and "FOR UPDATE" in sql
+    )
+    account_lock_sql, account_lock_params = next(
+        (sql, params) for sql, params in sql_calls if "FROM drive_accounts" in sql and "FOR UPDATE" in sql
+    )
+    renewal_sql, renewal_params = next(
+        (sql, params) for sql, params in sql_calls if "UPDATE drive_accounts" in sql and "DATE_ADD" in sql
+    )
+    assert "status IN ('uploading', 'staged')" in task_lock_sql
+    assert task_lock_params == ("dispatch-lease-valid-1",)
+    assert "current_dispatch_id=%s" in account_lock_sql
+    assert "current_worker_node=%s" in account_lock_sql
+    assert "dispatch_locked_until > UTC_TIMESTAMP()" in account_lock_sql
+    assert account_lock_params == (
+        "baicai_1@1",
+        "dispatch-lease-valid-1",
+        "worker-node-1",
+    )
+    assert "current_dispatch_id=%s" in renewal_sql
+    assert renewal_params[1:] == account_lock_params
+
+
+def test_validate_dispatch_rejects_lease_without_active_tasks(mock_db):
+    mock_db.fetchone.return_value = None
+    payload = {
+        "dispatch_id": "dispatch-without-tasks-1",
+        "account_name": "baicai_1@1",
+        "worker_node": "worker-node-1",
+    }
+
+    response = client.post("/api/dispatch/validate", json=payload, headers=auth_headers())
+
+    assert response.status_code == 200
+    assert response.json() == {"active": False}
+    sql_calls = [call.args[0] for call in mock_db.execute.call_args_list]
+    assert any("current_dispatch_id=NULL" in sql for sql in sql_calls)
+    assert not any("UPDATE worker_registry" in sql for sql in sql_calls)
+
+
+def test_report_files_ignores_clfstmp_files(mock_db):
+    payload = {
+        "worker_node": "worker-node-1",
+        "worker_api_url": "http://worker-node-1.example.com:8001/task/upload",
+        "files": [
+            {"path": "movie/complete.mkv", "size_bytes": 123},
+            {"path": "movie/downloading.CLFSTMP", "size_bytes": 456},
+            {"path": "movie/downloading.mkv.clfstmp.progress", "size_bytes": 789},
+        ],
+        "upload_method": "copy",
+    }
+
+    response = client.post("/api/report_files", json=payload, headers=auth_headers())
+
+    assert response.status_code == 200
+    values = mock_db.executemany.call_args[0][1]
+    assert values == [
+        ("movie/complete.mkv", None, 123, None, "pending", "worker-node-1", "copy")
     ]
 
 
@@ -176,6 +398,8 @@ def test_dispatch_uploader_tasks_rolls_back_when_worker_post_fails():
     ]
     mock_cursor.fetchone.side_effect = [
         {"active_count": 0},
+        {"acquired": 1},
+        None,
     ]
 
     mock_response = MagicMock()
@@ -185,7 +409,7 @@ def test_dispatch_uploader_tasks_rolls_back_when_worker_post_fails():
         main.dispatch_uploader_tasks()
 
     sql_calls = [call[0][0] for call in mock_cursor.execute.call_args_list]
-    assert any("UPDATE file_tasks SET status='pending', updated_at=UTC_TIMESTAMP() WHERE id IN" in sql for sql in sql_calls)
+    assert any("UPDATE file_tasks SET status='pending', dispatch_id=NULL" in sql and "WHERE dispatch_id=%s" in sql for sql in sql_calls)
 
 
 def test_dispatch_uploader_tasks_sets_uploading_updated_at_to_utc():
@@ -204,7 +428,8 @@ def test_dispatch_uploader_tasks_sets_uploading_updated_at_to_utc():
     ]
     mock_cursor.fetchone.side_effect = [
         {"active_count": 0},
-        {"active_count": 2},
+        {"acquired": 1},
+        None,
     ]
 
     mock_response = MagicMock()
@@ -215,7 +440,7 @@ def test_dispatch_uploader_tasks_sets_uploading_updated_at_to_utc():
 
     sql_calls = [call[0][0] for call in mock_cursor.execute.call_args_list]
     assert any(
-        "UPDATE file_tasks SET status='uploading', account_used=%s, updated_at=UTC_TIMESTAMP()" in sql
+        "UPDATE file_tasks SET status='uploading', account_used=%s, dispatch_id=%s, updated_at=UTC_TIMESTAMP()" in sql
         for sql in sql_calls
     )
 
@@ -235,6 +460,8 @@ def test_dispatch_uploader_tasks_breaks_when_tasks_are_preempted():
     ]
     mock_cursor.fetchone.side_effect = [
         {"active_count": 0},
+        {"acquired": 1},
+        None,
     ]
 
     with patch("main.get_db_connection", return_value=mock_connection), patch("main.httpx.post") as mock_post:
@@ -261,7 +488,7 @@ def test_dispatch_uploader_tasks_uses_utc_for_worker_liveness_queries():
     assert all("NOW()" not in sql for sql in sql_calls)
 
 
-def test_acquire_account_lock_cleaner_ignores_dispatch_cooldown():
+def test_acquire_account_lock_cleaner_checks_dispatch_cooldown():
     mock_cursor = MagicMock()
     mock_cursor.rowcount = 1
 
@@ -270,7 +497,7 @@ def test_acquire_account_lock_cleaner_ignores_dispatch_cooldown():
     sql = mock_cursor.execute.call_args[0][0]
     assert "dispatch_locked_until IS NULL OR dispatch_locked_until < UTC_TIMESTAMP()" in sql
     assert "quota_blocked_until IS NULL OR quota_blocked_until < UTC_TIMESTAMP()" in sql
-    assert "dispatch_cooldown_until" not in sql
+    assert "dispatch_cooldown_until IS NULL OR dispatch_cooldown_until < UTC_TIMESTAMP()" in sql
 
 
 def test_acquire_account_lock_uploader_still_checks_dispatch_cooldown():
@@ -311,7 +538,7 @@ def test_dispatch_uploader_tasks_releases_stale_uploading_tasks():
     mock_cursor.rowcount = 253
     mock_cursor.fetchall.side_effect = [
         [],
-        [{"account_used": "baicai_2@1", "worker_node": "worker-node-3", "task_count": 253}],
+        [{"account_used": "baicai_2@1", "worker_node": "worker-node-3", "dispatch_id": "d" * 32, "task_count": 253}],
         [],
     ]
 
@@ -321,7 +548,20 @@ def test_dispatch_uploader_tasks_releases_stale_uploading_tasks():
     sql_calls = [call[0][0] for call in mock_cursor.execute.call_args_list]
     assert any("updated_at <= DATE_SUB(UTC_TIMESTAMP(), INTERVAL %s MINUTE)" in sql for sql in sql_calls)
     assert any("UPDATE file_tasks" in sql and "SET status='pending'" in sql for sql in sql_calls)
-    mock_release_lock.assert_called_once_with(mock_cursor, "baicai_2@1")
+    mock_release_lock.assert_called_once_with(mock_cursor, "baicai_2@1", "d" * 32, "worker-node-3")
+
+
+def test_requeue_stale_not_found_tasks_uses_bounded_retry_delay():
+    cursor = MagicMock()
+    cursor.rowcount = 3
+
+    assert main.requeue_stale_not_found_tasks(cursor) == 3
+
+    sql, params = cursor.execute.call_args.args
+    assert "WHERE status='not_found'" in sql
+    assert "DATE_SUB(UTC_TIMESTAMP(), INTERVAL %s MINUTE)" in sql
+    assert "account_used=NULL" in sql
+    assert params == (main.NOT_FOUND_RETRY_MINUTES,)
 
 
 def test_dispatch_uploader_tasks_releases_lock_when_no_pending_tasks():
@@ -339,13 +579,15 @@ def test_dispatch_uploader_tasks_releases_lock_when_no_pending_tasks():
     ]
     mock_cursor.fetchone.side_effect = [
         {"active_count": 0},
+        {"acquired": 1},
+        None,
     ]
 
     with patch("main.get_db_connection", return_value=mock_connection):
         main.dispatch_uploader_tasks()
 
     sql_calls = [call[0][0] for call in mock_cursor.execute.call_args_list]
-    assert any("UPDATE drive_accounts SET dispatch_locked_until = NULL" in sql for sql in sql_calls)
+    assert any("SET dispatch_locked_until=NULL, current_dispatch_id=NULL" in sql for sql in sql_calls)
 
 
 def test_dispatch_uploader_tasks_filters_dispatch_and_quota_locks():
@@ -361,6 +603,8 @@ def test_dispatch_uploader_tasks_filters_dispatch_and_quota_locks():
     ]
     mock_cursor.fetchone.side_effect = [
         {"active_count": 0},
+        {"acquired": 1},
+        None,
     ]
 
     with patch("main.get_db_connection", return_value=mock_connection):
@@ -390,6 +634,8 @@ def test_dispatch_uploader_tasks_rechecks_cleaner_lock_when_marking_uploading():
     ]
     mock_cursor.fetchone.side_effect = [
         {"active_count": 0},
+        {"acquired": 1},
+        None,
     ]
 
     mock_response = MagicMock()
@@ -420,6 +666,8 @@ def test_dispatch_uploader_tasks_prefers_original_account_pending_tasks():
     ]
     mock_cursor.fetchone.side_effect = [
         {"active_count": 0},
+        {"acquired": 1},
+        None,
     ]
 
     mock_response = MagicMock()
@@ -488,13 +736,14 @@ def test_dispatch_cleaner_tasks_cleans_immediately_when_group_all_quota_blocked(
     mock_cursor.fetchall.side_effect = [
         [],
         [{"account_used": "baicai_1@1", "worker_node": "worker-node-1"}],
-        [{"file_path": "movie/test1.mkv"}],
+        [{"id": 1, "file_path": "movie/test1.mkv", "source_base_dir": "/cache/downloads"}],
     ]
     mock_cursor.fetchone.side_effect = [
         None,
         {"total_uploaders": 2, "blocked_uploaders": 2},
         {"cleaner_mapping": "baicai-1@1-3"},
         {"api_url": "http://worker:8001/task/upload"},
+        None,
     ]
 
     mock_response = MagicMock()
@@ -504,8 +753,24 @@ def test_dispatch_cleaner_tasks_cleans_immediately_when_group_all_quota_blocked(
         main.dispatch_cleaner_tasks()
 
     mock_post.assert_called_once()
-    assert mock_post.call_args.kwargs["json"]["dest_name"] == "baicai-big"
+    dispatched_payload = json.loads(mock_post.call_args.kwargs["content"])
+    assert dispatched_payload["dest_name"] == "baicai-big2"
+    assert dispatched_payload["remote_dir"] == "LongEmby-B"
     sql_calls = [call[0][0] for call in mock_cursor.execute.call_args_list]
+    task_pick_call = next(
+        call
+        for call in mock_cursor.execute.call_args_list
+        if "JOIN drive_accounts da ON ft.account_used = da.account_name" in call.args[0]
+    )
+    task_bind_call = next(
+        call
+        for call in mock_cursor.execute.call_args_list
+        if "SET ft.dispatch_id=%s" in call.args[0]
+    )
+    assert "AND ft.worker_node=%s" in task_pick_call.args[0]
+    assert task_pick_call.args[1][1] == "worker-node-1"
+    assert "AND ft.worker_node=%s" in task_bind_call.args[0]
+    assert task_bind_call.args[1][2] == "worker-node-1"
     assert any("quota_blocked_until IS NOT NULL AND quota_blocked_until > UTC_TIMESTAMP()" in sql for sql in sql_calls)
     assert not any("updated_at >= DATE_SUB(UTC_TIMESTAMP()" in sql for sql in sql_calls)
 
@@ -519,13 +784,14 @@ def test_dispatch_cleaner_tasks_force_all_bypasses_idle_window_but_not_safety():
     mock_cursor.fetchall.side_effect = [
         [],
         [{"account_used": "baicai_1@1", "worker_node": "worker-node-1"}],
-        [{"file_path": "movie/test1.mkv"}],
+        [{"id": 1, "file_path": "movie/test1.mkv", "source_base_dir": "/cache/downloads"}],
     ]
     mock_cursor.fetchone.side_effect = [
         None,
         {"total_uploaders": 2, "blocked_uploaders": 1},
         {"cleaner_mapping": "baicai-1@1-3"},
         {"api_url": "http://worker:8001/task/upload"},
+        None,
     ]
 
     mock_response = MagicMock()
@@ -547,7 +813,7 @@ def test_dispatch_cleaner_tasks_skips_stale_nodes_and_releases_cleaner_lock():
 
     mock_cursor.fetchall.side_effect = [
         [{"node_name": "worker-node-1"}],
-        [{"cleaner_account": "baicai-1@1-3"}],
+        [{"account_name": "baicai-1@1-3", "current_dispatch_id": "d" * 32}],
         [{"account_used": "baicai_1@1", "worker_node": "worker-node-1"}],
     ]
 
@@ -555,7 +821,15 @@ def test_dispatch_cleaner_tasks_skips_stale_nodes_and_releases_cleaner_lock():
         main.dispatch_cleaner_tasks()
 
     mock_post.assert_not_called()
-    mock_release_lock.assert_called_once_with(mock_cursor, "baicai-1@1-3")
+    mock_release_lock.assert_not_called()
+    stale_release_sql = next(
+        call.args[0]
+        for call in mock_cursor.execute.call_args_list
+        if "UPDATE drive_accounts" in call.args[0] and "NOT EXISTS" in call.args[0]
+    )
+    assert "dispatch_id=%s" in stale_release_sql
+    assert "status='staged'" in stale_release_sql
+    assert "updated_at > DATE_SUB(UTC_TIMESTAMP()" in stale_release_sql
 
 
 def test_dispatch_cleaner_tasks_stops_retrying_same_node_after_worker_busy():
@@ -570,13 +844,14 @@ def test_dispatch_cleaner_tasks_stops_retrying_same_node_after_worker_busy():
             {"account_used": "baicai_1@1", "worker_node": "worker-node-3"},
             {"account_used": "baicai_2@1", "worker_node": "worker-node-3"},
         ],
-        [{"file_path": "movie/test1.mkv"}],
+        [{"id": 1, "file_path": "movie/test1.mkv", "source_base_dir": "/cache/downloads"}],
     ]
     mock_cursor.fetchone.side_effect = [
         None,
         {"total_uploaders": 2, "blocked_uploaders": 2},
         {"cleaner_mapping": "baicai-1@1-3"},
         {"api_url": "http://worker:8001/task/upload"},
+        None,
     ]
 
     request = httpx.Request("POST", "http://worker:8001/task/upload")
@@ -630,7 +905,7 @@ def test_report_status_not_found_clears_account_used_when_requeueing_remaining_t
 
     assert response.status_code == 200
     sql_calls = [call[0][0] for call in mock_db.execute.call_args_list]
-    assert any("UPDATE file_tasks SET status='pending', account_used=NULL, updated_at=UTC_TIMESTAMP()" in sql for sql in sql_calls)
+    assert any("UPDATE file_tasks SET status='pending', account_used=NULL, dispatch_id=NULL" in sql for sql in sql_calls)
 
 
 def test_report_status_rejects_retry_later_status():
@@ -659,8 +934,29 @@ def test_report_status_failed_keeps_original_account_preference(mock_db):
 
     assert response.status_code == 200
     sql_calls = [call[0][0] for call in mock_db.execute.call_args_list]
-    assert any("UPDATE file_tasks SET status='pending', updated_at=UTC_TIMESTAMP() WHERE account_used=%s AND status='uploading'" in sql for sql in sql_calls)
+    assert any("UPDATE file_tasks SET status='pending', dispatch_id=NULL" in sql and "account_used=%s" in sql for sql in sql_calls)
     assert not any("UPDATE file_tasks SET status='pending', account_used=NULL WHERE account_used=%s AND status='uploading'" in sql for sql in sql_calls)
+
+
+def test_report_status_cleaner_failed_sets_dispatch_cooldown(mock_db):
+    payload = {
+        "account_name": "baicai-1@1-3",
+        "status": "failed",
+        "successful_files": [],
+    }
+    mock_db.fetchone.side_effect = [
+        {"role": "cleaner"},
+    ]
+
+    response = client.post("/api/report_status", json=payload, headers=auth_headers())
+
+    assert response.status_code == 200
+    sql_calls = [call[0][0] for call in mock_db.execute.call_args_list]
+    assert any(
+        "dispatch_locked_until = NULL" in sql and "dispatch_cooldown_until = DATE_ADD" in sql
+        for sql in sql_calls
+    )
+    assert not any("UPDATE file_tasks SET status='pending'" in sql for sql in sql_calls)
 
 
 def test_trigger_dispatch_uploader_tasks_async_reruns_when_triggered_during_dispatch():
@@ -684,24 +980,339 @@ def test_trigger_dispatch_uploader_tasks_async_reruns_when_triggered_during_disp
     assert main._dispatch_trigger_pending.is_set() is False
 
 
-def test_clean_success_requires_file_list(mock_db):
+def test_report_status_ignores_stale_dispatch_without_mutating_tasks(mock_db):
+    mock_db.fetchone.return_value = {
+        "role": "uploader",
+        "current_dispatch_id": "a" * 32,
+        "current_worker_node": "worker-node-1",
+    }
+    payload = {
+        "account_name": "baicai_1@1",
+        "status": "completed",
+        "dispatch_id": "b" * 32,
+        "worker_node": "worker-node-1",
+        "successful_files": ["movie/stale.mkv"],
+    }
+
+    response = client.post("/api/report_status", json=payload, headers=auth_headers())
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ignored", "reason": "stale_dispatch"}
+    assert len(mock_db.execute.call_args_list) == 2
+    assert "FROM file_tasks" in mock_db.execute.call_args_list[0].args[0]
+    assert "FOR UPDATE" in mock_db.execute.call_args_list[0].args[0]
+    assert "account_used=%s" not in mock_db.execute.call_args_list[0].args[0]
+    assert "FROM drive_accounts" in mock_db.execute.call_args_list[1].args[0]
+    assert "FOR UPDATE" in mock_db.execute.call_args_list[1].args[0]
+
+
+def test_report_status_uploading_without_active_dispatch_task_cancels_worker(mock_db):
+    dispatch_id = "f" * 32
+    mock_db.fetchone.side_effect = [
+        None,
+        {
+            "role": "uploader",
+            "current_dispatch_id": dispatch_id,
+            "current_worker_node": "worker-node-1",
+        },
+    ]
+    payload = {
+        "account_name": "baicai_1@1",
+        "status": "uploading",
+        "dispatch_id": dispatch_id,
+        "worker_node": "worker-node-1",
+    }
+
+    response = client.post("/api/report_status", json=payload, headers=auth_headers())
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ignored", "reason": "stale_dispatch"}
+    assert not any(
+        "SET updated_at = UTC_TIMESTAMP()" in call.args[0]
+        for call in mock_db.execute.call_args_list
+    )
+    release_sql = next(
+        call.args[0]
+        for call in mock_db.execute.call_args_list
+        if "SET dispatch_locked_until=NULL" in call.args[0]
+    )
+    assert "current_dispatch_id=%s AND current_worker_node=%s" in release_sql
+
+
+def test_report_status_uploading_accepts_heartbeat_with_last_successful_file(mock_db):
+    dispatch_id = "9" * 32
+    mock_db.fetchone.return_value = {
+        "role": "uploader",
+        "current_dispatch_id": dispatch_id,
+        "current_worker_node": "worker-node-1",
+    }
+    payload = {
+        "account_name": "baicai_1@1",
+        "status": "uploading",
+        "dispatch_id": dispatch_id,
+        "worker_node": "worker-node-1",
+        "successful_files": ["movie/last.mkv"],
+    }
+
+    with patch(
+        "main.refresh_uploader_heartbeat", return_value=(0, 0, 1)
+    ):
+        response = client.post("/api/report_status", json=payload, headers=auth_headers())
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "success"}
+
+
+def test_report_status_matching_dispatch_scopes_every_task_update(mock_db):
+    dispatch_id = "c" * 32
+    mock_db.fetchone.return_value = {
+        "role": "uploader",
+        "current_dispatch_id": dispatch_id,
+        "current_worker_node": "worker-node-1",
+    }
+    payload = {
+        "account_name": "baicai_1@1",
+        "status": "completed",
+        "dispatch_id": dispatch_id,
+        "worker_node": "worker-node-1",
+        "successful_files": ["movie/current.mkv"],
+    }
+
+    response = client.post("/api/report_status", json=payload, headers=auth_headers())
+
+    assert response.status_code == 200
+    task_updates = [
+        call for call in mock_db.execute.call_args_list
+        if "UPDATE file_tasks" in call.args[0]
+    ]
+    assert task_updates
+    assert all("dispatch_id=%s" in call.args[0] for call in task_updates)
+    assert any(dispatch_id in call.args[1] for call in task_updates)
+    release_sql = next(call.args[0] for call in mock_db.execute.call_args_list if "current_dispatch_id=NULL" in call.args[0])
+    assert "current_dispatch_id=%s AND current_worker_node=%s" in release_sql
+
+
+def test_report_status_cleaner_heartbeat_renews_lease_and_worker(mock_db):
+    dispatch_id = "d" * 32
+    mock_db.fetchone.return_value = {
+        "role": "cleaner",
+        "current_dispatch_id": dispatch_id,
+        "current_worker_node": "worker-node-2",
+    }
+    payload = {
+        "account_name": "baicai-1@1-3",
+        "status": "uploading",
+        "dispatch_id": dispatch_id,
+        "worker_node": "worker-node-2",
+    }
+
+    response = client.post("/api/report_status", json=payload, headers=auth_headers())
+
+    assert response.status_code == 200
+    sql_calls = [call.args[0] for call in mock_db.execute.call_args_list]
+    assert any("SET dispatch_locked_until = DATE_ADD" in sql and "role=%s" in sql for sql in sql_calls)
+    assert any("UPDATE worker_registry SET last_active=UTC_TIMESTAMP() WHERE node_name=%s" in sql for sql in sql_calls)
+    task_lock = next(
+        call for call in mock_db.execute.call_args_list
+        if "FROM file_tasks" in call.args[0] and "FOR UPDATE" in call.args[0]
+    )
+    assert "account_used" not in task_lock.args[0]
+    assert task_lock.args[1] == (dispatch_id,)
+
+
+def test_dispatch_uploader_payload_has_dispatch_and_source_root():
+    mock_cursor = MagicMock()
+    mock_connection = MagicMock()
+    mock_connection.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_cursor.rowcount = 1
+    mock_cursor.fetchall.side_effect = [
+        [],
+        [],
+        [{"node_name": "worker-node-1", "api_url": "http://worker:8001/task/upload"}],
+        [{"account_name": "baicai_1@1"}],
+        [{
+            "id": 1,
+            "file_path": "movie/test.mkv",
+            "source_base_dir": "/cache/links",
+            "size_bytes": 123,
+            "source_mtime": 456.5,
+            "upload_method": "move",
+        }],
+        [],
+    ]
+    mock_cursor.fetchone.side_effect = [
+        {"active_count": 0},
+        {"acquired": 1},
+        None,
+    ]
+    response = MagicMock()
+    response.raise_for_status.return_value = None
+
+    with patch("main.get_db_connection", return_value=mock_connection), \
+         patch("main.httpx.post", return_value=response) as mock_post, \
+         patch("main._new_dispatch_id", return_value="e" * 32):
+        main.dispatch_uploader_tasks()
+
+    payload = json.loads(mock_post.call_args.kwargs["content"])
+    assert payload["dispatch_id"] == "e" * 32
+    assert payload["worker_node"] == "worker-node-1"
+    assert payload["source_base_dirs"] == ["/cache/links"]
+    assert payload["expected_sizes"] == [123]
+    assert payload["expected_mtimes"] == [456.5]
+    assert payload["remote_dir"] == "LongEmby-B"
+    node_query = next(call.args[0] for call in mock_cursor.execute.call_args_list if "FROM worker_registry" in call.args[0] and "node_name, api_url" in call.args[0])
+    assert "protocol_version >= 2" in node_query
+
+
+def test_dispatch_uploader_timeout_preserves_uncertain_dispatch():
+    mock_cursor = MagicMock()
+    mock_connection = MagicMock()
+    mock_connection.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_cursor.rowcount = 1
+    mock_cursor.fetchall.side_effect = [
+        [],
+        [],
+        [{"node_name": "worker-node-1", "api_url": "http://worker:8001/task/upload"}],
+        [{"account_name": "baicai_1@1"}],
+        [{"id": 1, "file_path": "movie/test.mkv", "source_base_dir": "/cache/downloads", "upload_method": "move"}],
+    ]
+    mock_cursor.fetchone.side_effect = [
+        {"active_count": 0},
+        {"acquired": 1},
+        None,
+    ]
+
+    with patch("main.get_db_connection", return_value=mock_connection), \
+         patch("main.httpx.post", side_effect=httpx.ReadTimeout("uncertain")), \
+         patch("main._new_dispatch_id", return_value="f" * 32):
+        main.dispatch_uploader_tasks()
+
+    sql_calls = [call.args[0] for call in mock_cursor.execute.call_args_list]
+    assert any("SET status='uploading'" in sql and "dispatch_id=%s" in sql for sql in sql_calls)
+    assert not any("SET status='pending', dispatch_id=NULL" in sql and "WHERE dispatch_id=%s" in sql for sql in sql_calls)
+    assert not any("current_dispatch_id=NULL" in sql for sql in sql_calls)
+
+
+def test_dispatch_cleaner_rechecks_uploads_after_acquiring_lock():
+    mock_cursor = MagicMock()
+    mock_connection = MagicMock()
+    mock_connection.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_cursor.rowcount = 1
+    mock_cursor.fetchall.side_effect = [
+        [],
+        [{"account_used": "baicai_1@1", "worker_node": "worker-node-1"}],
+        [{"id": 1, "file_path": "movie/test.mkv", "source_base_dir": "/cache/downloads"}],
+    ]
+    mock_cursor.fetchone.side_effect = [
+        None,
+        {"total_uploaders": 2, "blocked_uploaders": 2},
+        {"cleaner_mapping": "baicai-1@1-3"},
+        {"api_url": "http://worker:8001/task/upload"},
+        {"has_uploading": 1},
+    ]
+
+    with patch("main.get_db_connection", return_value=mock_connection), \
+         patch("main.httpx.post") as mock_post, \
+         patch("main._new_dispatch_id", return_value="1" * 32):
+        main.dispatch_cleaner_tasks()
+
+    mock_post.assert_not_called()
+    sql_calls = [call.args[0] for call in mock_cursor.execute.call_args_list]
+    assert not any("SET ft.dispatch_id=%s" in sql for sql in sql_calls)
+    assert any("current_dispatch_id=NULL" in sql and "current_dispatch_id=%s" in sql for sql in sql_calls)
+
+
+def test_report_files_accepts_valid_node_hmac(mock_db):
+    payload = {
+        "worker_node": "worker-node-1",
+        "worker_api_url": "http://worker-node-1:8001/task/upload",
+        "protocol_version": 2,
+        "files": [{"path": " movie.mkv ", "source_base_dir": "/cache/downloads"}],
+    }
+    raw_body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+    timestamp = "1700000000"
+    token = "node-secret-token-123"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Baicai-Node": "worker-node-1",
+        "X-Baicai-Timestamp": timestamp,
+        "X-Baicai-Signature": main._node_signature(token, timestamp, raw_body),
+    }
+
+    with patch.object(main, "WORKER_TOKEN_MAP", {"worker-node-1": token}), patch("main.time.time", return_value=1700000000):
+        response = client.post("/api/report_files", content=raw_body, headers=headers)
+
+    assert response.status_code == 200
+    assert mock_db.executemany.call_args.args[1][0][0] == " movie.mkv "
+    assert mock_db.executemany.call_args.args[1][0][1] == "/cache/downloads"
+
+
+def test_report_files_rejects_expired_node_hmac(mock_db):
+    payload = {
+        "worker_node": "worker-node-1",
+        "worker_api_url": "http://worker-node-1:8001/task/upload",
+        "protocol_version": 2,
+        "files": [],
+    }
+    raw_body = json.dumps(payload, separators=(",", ":")).encode()
+    token = "node-secret-token-123"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Baicai-Node": "worker-node-1",
+        "X-Baicai-Timestamp": "1699999000",
+        "X-Baicai-Signature": main._node_signature(token, "1699999000", raw_body),
+    }
+
+    with patch.object(main, "WORKER_TOKEN_MAP", {"worker-node-1": token}), patch(
+        "main.time.time", return_value=1700000000
+    ):
+        response = client.post("/api/report_files", content=raw_body, headers=headers)
+
+    assert response.status_code == 401
+    mock_db.execute.assert_not_called()
+
+
+def test_encode_worker_request_uses_node_hmac_without_bearer():
+    token = "node-secret-token-123"
+    with patch.object(main, "WORKER_TOKEN_MAP", {"worker-node-1": token}), patch("main.time.time", return_value=1700000000):
+        raw_body, headers = main.encode_worker_request("worker-node-1", {"task_type": "upload"})
+
+    assert "Authorization" not in headers
+    assert headers["X-Baicai-Node"] == "worker-node-1"
+    assert headers["X-Baicai-Signature"] == main._node_signature(token, "1700000000", raw_body)
+
+def test_clean_success_completes_dispatch_batch_without_file_list(mock_db):
+    dispatch_id = "clean-dispatch-1"
     payload = {
         "account_name": "baicai-1@1-3",
         "status": "clean_success",
         "successful_files": [],
+        "dispatch_id": dispatch_id,
+        "worker_node": "worker-node-1",
     }
     mock_db.fetchone.side_effect = [
-        {"role": "cleaner"},
+        {"id": 1},
+        {
+            "role": "cleaner",
+            "current_dispatch_id": dispatch_id,
+            "current_worker_node": "worker-node-1",
+        },
     ]
 
     response = client.post("/api/report_status", json=payload, headers=auth_headers())
 
     assert response.status_code == 200
-    sql_calls = [call[0][0] for call in mock_db.execute.call_args_list]
-    assert not any("JOIN drive_accounts da" in sql and "SET ft.status = 'completed'" in sql for sql in sql_calls)
+    batch_call = next(
+        call
+        for call in mock_db.execute.call_args_list
+        if "JOIN drive_accounts da" in call.args[0]
+        and "SET ft.status='completed'" in call.args[0]
+    )
+    assert "ft.dispatch_id=%s" in batch_call.args[0]
+    assert batch_call.args[1] == ["baicai-1@1-3", dispatch_id]
 
 
-def test_clean_success_updates_only_reported_files(mock_db):
+def test_clean_success_accepts_legacy_file_details_then_completes_remaining_batch(mock_db):
     payload = {
         "account_name": "baicai-1@1-3",
         "status": "clean_success",
@@ -716,6 +1327,7 @@ def test_clean_success_updates_only_reported_files(mock_db):
     assert response.status_code == 200
     sql_calls = [call[0][0] for call in mock_db.execute.call_args_list]
     assert any("JOIN drive_accounts da" in sql and "ft.file_path IN" in sql for sql in sql_calls)
+    assert any("JOIN drive_accounts da" in sql and "SET ft.status='completed'" in sql for sql in sql_calls)
 
 
 def test_cleaner_uploading_with_successful_files_updates_reported_batch(mock_db):
@@ -753,10 +1365,15 @@ def test_get_upload_usage_returns_beijing_time_fields(mock_db):
     mock_db.fetchall.return_value = [
         {
             "account_name": "baicai_1@1",
+            "role": "uploader",
+            "is_active": 1,
             "uploaded_files": 2,
             "uploaded_bytes": 2 * 1024 ** 3,
             "last_uploaded_at_utc": "2026-06-10 01:00:00",
             "last_uploaded_at_bj": "2026-06-10 09:00:00",
+            "dispatch_locked_until": "2099-01-01 02:00:00",
+            "dispatch_cooldown_until": None,
+            "quota_blocked_until": "2099-01-01 03:00:00",
         }
     ]
 
@@ -772,16 +1389,58 @@ def test_get_upload_usage_returns_beijing_time_fields(mock_db):
         "accounts": [
             {
                 "account_name": "baicai_1@1",
+                "role": "uploader",
+                "is_active": 1,
                 "uploaded_files": 2,
                 "uploaded_bytes": 2 * 1024 ** 3,
                 "uploaded_gib": 2.0,
                 "last_uploaded_at_utc": "2026-06-10 01:00:00",
                 "last_uploaded_at_bj": "2026-06-10 09:00:00",
+                "dispatch_locked_until_utc": "2099-01-01 02:00:00",
+                "dispatch_locked_until_bj": "2099-01-01 10:00:00",
+                "dispatch_cooldown_until_utc": None,
+                "dispatch_cooldown_until_bj": None,
+                "quota_blocked_until_utc": "2099-01-01 03:00:00",
+                "quota_blocked_until_bj": "2099-01-01 11:00:00",
+                "unlock_at_utc": "2099-01-01 03:00:00",
+                "unlock_at_bj": "2099-01-01 11:00:00",
+                "active_locks": ["dispatch_locked_until", "quota_blocked_until"],
+                "is_available_now": False,
             }
         ],
     }
     sql = mock_db.execute.call_args[0][0]
-    assert "DATE_ADD(uploaded_at, INTERVAL 8 HOUR)" in sql
+    assert "FROM drive_accounts da" in sql
+    assert "LEFT JOIN (" in sql
+    assert "dispatch_locked_until" in sql
+
+
+def test_get_upload_usage_includes_zero_usage_accounts_and_unlock_time(mock_db):
+    mock_db.fetchall.return_value = [
+        {
+            "account_name": "baicai_2@1",
+            "role": "uploader",
+            "is_active": 1,
+            "uploaded_files": 0,
+            "uploaded_bytes": 0,
+            "last_uploaded_at_utc": None,
+            "last_uploaded_at_bj": None,
+            "dispatch_locked_until": None,
+            "dispatch_cooldown_until": None,
+            "quota_blocked_until": "2099-01-01 00:00:00",
+        }
+    ]
+
+    response = client.get("/api/upload_usage?hours=24", headers=auth_headers())
+
+    assert response.status_code == 200
+    account = response.json()["accounts"][0]
+    assert account["uploaded_files"] == 0
+    assert account["uploaded_bytes"] == 0
+    assert account["unlock_at_utc"] == "2099-01-01 00:00:00"
+    assert account["unlock_at_bj"] == "2099-01-01 08:00:00"
+    assert account["active_locks"] == ["quota_blocked_until"]
+    assert account["is_available_now"] is False
 
 
 def test_get_daily_upload_usage_groups_by_beijing_date(mock_db):

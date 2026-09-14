@@ -12,9 +12,11 @@ services:
       TZ: Asia/Shanghai
     volumes:
       - /data/links:/data/links
+      - /cache/links:/cache/links
       - /data/rclone-cache:/data/rclone-cache
       - ./logs/rclone:/data/logs/rclone
       - ./runtime:/opt/baicai-worker/runtime
+      # 生产节点的 rclone 1.65 支持现有带 @ 的 remote 名；镜像 apt 1.60 不支持。
       - /usr/bin/rclone:/usr/bin/rclone:ro
       - /root/.config/rclone:/root/.config/rclone
 
@@ -29,8 +31,7 @@ services:
       TZ: Asia/Shanghai
     volumes:
       - /data/links:/data/links
+      - /cache/links:/cache/links
       - /data/rclone-cache:/data/rclone-cache
       - ./logs/rclone:/data/logs/rclone
       - ./runtime:/opt/baicai-worker/runtime
-      - /usr/bin/rclone:/usr/bin/rclone:ro
-      - /root/.config/rclone:/root/.config/rclone

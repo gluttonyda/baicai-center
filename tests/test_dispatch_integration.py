@@ -1,9 +1,12 @@
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+import json
 import os
 import sys
 
 os.environ.setdefault("API_TOKEN", "test-token")
+os.environ.setdefault("ALLOW_LEGACY_NODE_AUTH", "true")
+os.environ.setdefault("ALLOW_LEGACY_UNLEASED_REPORTS", "true")
 os.environ.setdefault("DB_HOST", "test-db-host")
 os.environ.setdefault("DB_USER", "test-db-user")
 os.environ.setdefault("DB_PASSWORD", "test-db-password")
@@ -41,13 +44,17 @@ def test_dispatch_uploader_tasks_distributes_across_two_workers():
     ]
     mock_cursor.fetchone.side_effect = [
         {"active_count": 0},
+        {"acquired": 1},
+        None,
         {"active_count": 0},
+        {"acquired": 1},
+        None,
     ]
 
     post_response = MagicMock()
     post_response.raise_for_status.return_value = None
 
-    with patch("main.get_db_connection", return_value=mock_connection), patch("main.httpx.post", return_value=post_response) as mock_post:
+    with patch("main.get_db_connection", return_value=mock_connection), patch("main.httpx.post", return_value=post_response) as mock_post, patch("main.current_upload_concurrency_limit", return_value=2):
         main.dispatch_uploader_tasks()
 
     assert mock_post.call_count == 2
@@ -55,7 +62,9 @@ def test_dispatch_uploader_tasks_distributes_across_two_workers():
     second_call = mock_post.call_args_list[1]
     assert first_call.args[0] == "http://worker-1:8001/task/upload"
     assert second_call.args[0] == "http://worker-2:8001/task/upload"
-    assert first_call.kwargs["json"]["account_name"] == "baicai_1@1"
-    assert second_call.kwargs["json"]["account_name"] == "baicai_2@1"
-    assert first_call.kwargs["json"]["files"] == ["movie/w1.mkv"]
-    assert second_call.kwargs["json"]["files"] == ["movie/w2.mkv"]
+    first_payload = json.loads(first_call.kwargs["content"])
+    second_payload = json.loads(second_call.kwargs["content"])
+    assert first_payload["account_name"] == "baicai_1@1"
+    assert second_payload["account_name"] == "baicai_2@1"
+    assert first_payload["files"] == ["movie/w1.mkv"]
+    assert second_payload["files"] == ["movie/w2.mkv"]

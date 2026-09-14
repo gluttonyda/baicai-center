@@ -36,6 +36,7 @@ Worker 是执行节点，负责：
 - 调用 `rclone copy` / `rclone move`
 - 周期性上报 `uploading` 心跳
 - 上报最终状态
+- 持久化派发任务和最终回执，重启后校验租约并恢复未完成工作
 
 ### Cleaner
 
@@ -72,11 +73,14 @@ file_tasks.staged
 ### 账号锁
 
 - `dispatch_locked_until`：防止同一账号短时间重复派发
+- `dispatch_cooldown_until`：调度失败后的短期冷却
 - `quota_blocked_until`：账号触发上传配额后的封禁时间
+
+`dispatch_id` 和节点名共同标识账号租约；过期回执不能改变后续批次。节点请求默认使用独立 `NODE_TOKEN` 生成 HMAC，Center 在 `WORKER_TOKEN_MAP` 中配置对应密钥。
 
 ### quota 处理
 
-当 Worker 发现当前 `rclone` 任务以非零退出码结束时，会上报 `403_quota`。
+Uploader 按日志和退出码区分错误：凭据失效上报 `credential_invalid`；检测到配额/限流错误或退出码为 8 时上报 `403_quota`；其他非零退出码上报 `failed`。凭据失效会停用账号，普通失败只回退未完成任务。
 
 Center 收到后会：
 
@@ -111,8 +115,10 @@ docker compose up -d --build
 ### Center 健康检查
 
 ```bash
-curl http://127.0.0.1:8080/
+curl --fail http://127.0.0.1:8080/health/ready
 ```
+
+`/health/ready` 同时检查数据库与协议 v2 必要字段；根路径 `/` 仅表示 API 进程可响应。旧库需按 [Center 节点说明](center_node.md#数据库初始化) 依次执行拆分锁、上传统计和派发协议迁移。
 
 ### 运行测试
 
@@ -121,6 +127,8 @@ PYTHONPATH=.:baicai-work pytest -q
 ```
 
 ### 清理 Worker 扫描缓存
+
+仅在 Center 数据库重置、确实需要全量重报时操作；先停止 Scanner 并备份缓存。普通重启保留 `runtime/`，尤其不要删除 `task_journal.db`。
 
 ```bash
 rm -f baicai-work/runtime/scanner_cache.db

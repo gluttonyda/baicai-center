@@ -1,9 +1,12 @@
+import hashlib
+import hmac
+import json
 import logging
 import os
 import subprocess
 import sys
 import threading
-import unicodedata
+import time
 
 import httpx
 
@@ -16,7 +19,7 @@ def require_env(name: str) -> str:
 
 
 CENTER_API = require_env("CENTER_API")
-API_TOKEN = require_env("API_TOKEN")
+NODE_TOKEN = require_env("NODE_TOKEN")
 WORKER_NODE_NAME = require_env("WORKER_NODE_NAME")
 WORKER_API_URL = require_env("WORKER_API_URL")
 RESERVED_INIT_SYNC_NODE_NAME = "Init_Scanner"
@@ -33,6 +36,7 @@ FAILED_CHUNKS_DIR = os.getenv("FAILED_CHUNKS_DIR", "./failed_init_sync_chunks")
 
 
 def validate_init_sync_worker_node_name() -> None:
+    # 历史快照使用独立的签名节点身份，避免历史同步心跳覆盖真实 Worker 的注册地址。
     if WORKER_NODE_NAME != RESERVED_INIT_SYNC_NODE_NAME:
         raise RuntimeError(
             f"init_sync.py 的 WORKER_NODE_NAME 必须为 {RESERVED_INIT_SYNC_NODE_NAME}，"
@@ -52,16 +56,31 @@ def submit_history_chunk(client: httpx.Client, chunk: list[str], batch_index: in
     payload = {
         "worker_node": WORKER_NODE_NAME,
         "worker_api_url": WORKER_API_URL,
+        "protocol_version": 2,
         "files": chunk,
         "is_history_sync": True,
         "upload_method": "move",
     }
+    raw_body = json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    timestamp = str(int(time.time()))
+    signature = hmac.new(
+        NODE_TOKEN.encode("utf-8"),
+        timestamp.encode("ascii") + b"\n" + raw_body,
+        hashlib.sha256,
+    ).hexdigest()
 
     try:
         response = client.post(
             CENTER_API,
-            json=payload,
-            headers={"Authorization": f"Bearer {API_TOKEN}"},
+            content=raw_body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Baicai-Node": WORKER_NODE_NAME,
+                "X-Baicai-Timestamp": timestamp,
+                "X-Baicai-Signature": signature,
+            },
             timeout=60.0,
         )
         response.raise_for_status()
@@ -132,7 +151,6 @@ def sync_remote_snapshot() -> tuple[bool, int, int, int]:
                     continue
 
                 clean_path = clean_path.replace("\\", "/")
-                clean_path = unicodedata.normalize("NFC", clean_path)
                 chunk.append(clean_path)
                 total_files += 1
 

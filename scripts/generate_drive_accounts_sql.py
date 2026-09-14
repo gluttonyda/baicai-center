@@ -5,7 +5,8 @@ from pathlib import Path
 def build_rows(group_count: int, uploaders_per_group: int, direct_count: int) -> list[tuple[str, str, str | None]]:
     rows: list[tuple[str, str, str | None]] = []
 
-    for group_index in range(1, group_count + 1):
+    # 沿用项目的 remote 命名约定；旧第 1 组由新直传账号替代。
+    for group_index in range(2, group_count + 1):
         cleaner_account = f"baicai-{group_index}@1-3"
 
         rows.append((cleaner_account, "cleaner", None))
@@ -14,12 +15,9 @@ def build_rows(group_count: int, uploaders_per_group: int, direct_count: int) ->
             uploader_account = f"baicai_{group_index}@{uploader_index}"
             rows.append((uploader_account, "uploader", cleaner_account))
 
-    for direct_index in range(1, direct_count + 1):
-        direct_account = f"baicai_big@{direct_index}"
-        # Direct-to-destination accounts still use role=uploader so the current
-        # scheduler can dispatch them. main.py detects the baicai_big prefix and
-        # marks successful uploads as completed instead of staged.
-        rows.append((direct_account, "uploader", None))
+    for direct_prefix in ("baicai_big", "baicai_big2"):
+        for direct_index in range(1, direct_count + 1):
+            rows.append((f"{direct_prefix}@{direct_index}", "uploader", None))
 
     return rows
 
@@ -34,8 +32,9 @@ def render_sql(group_count: int, uploaders_per_group: int, direct_count: int, ta
         "-- NOTE:",
         "-- 1. Cleaner accounts are fixed to baicai-<N>@1-3.",
         "-- 2. Uploader accounts are baicai_<N>@1..M and each maps to its fixed cleaner.",
-        "-- 3. Direct accounts baicai_big@<N> bypass cleaner by account-name prefix logic.",
-        "-- 4. The target remote baicai-big is not inserted into drive_accounts.",
+        "-- 3. Group 1 is retired and replaced by direct baicai_big2@<N> accounts.",
+        "-- 4. Direct baicai_big@<N> and baicai_big2@<N> accounts bypass cleaner.",
+        "-- 5. The target remote itself is not inserted into drive_accounts.",
         "",
         "INSERT INTO drive_accounts (account_name, role, is_active, cleaner_mapping)",
         "VALUES",
@@ -49,15 +48,15 @@ def render_sql(group_count: int, uploaders_per_group: int, direct_count: int, ta
     footer = [
         "ON DUPLICATE KEY UPDATE",
         "    role = VALUES(role),",
-        "    is_active = VALUES(is_active),",
-        "    cleaner_mapping = VALUES(cleaner_mapping),",
-        "    dispatch_locked_until = NULL,",
-        "    quota_blocked_until = NULL;",
+        "    cleaner_mapping = VALUES(cleaner_mapping);",
+        "",
+        "-- 重复导入仅更新角色与映射，保留 is_active、配额和所有运行锁。",
+        "-- 现场账号停用策略由部署者单独维护，不写入公共生成模板。",
         "",
         "-- Summary",
-        f"-- cleaners: {group_count}",
-        f"-- uploaders: {group_count * uploaders_per_group}",
-        f"-- direct_uploaders: {direct_count}",
+        f"-- cleaners: {max(0, group_count - 1)}",
+        f"-- uploaders: {max(0, group_count - 1) * uploaders_per_group}",
+        f"-- direct_uploaders: {direct_count * 2}",
         f"-- total_rows: {len(rows)}",
     ]
 
@@ -69,7 +68,7 @@ def main() -> None:
     parser.add_argument("--group-count", type=int, default=9, help="Number of uploader/cleaner groups.")
     parser.add_argument("--uploaders-per-group", type=int, default=3, help="Number of uploader accounts per group.")
     parser.add_argument("--direct-count", type=int, default=3, help="Number of direct-to-destination baicai_big accounts.")
-    parser.add_argument("--target-remote", default="baicai-big", help="Fixed cleaner destination remote name.")
+    parser.add_argument("--target-remote", default="baicai-big2", help="Fixed cleaner destination remote name.")
     parser.add_argument("--output", default="/opt/baicai-center/IMPORT_DRIVE_ACCOUNTS.sql", help="Output SQL file path.")
     args = parser.parse_args()
 
