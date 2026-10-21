@@ -2066,3 +2066,45 @@ def test_validate_worker_api_url_map_entries_rejects_invalid_entry(monkeypatch):
 
     with pytest.raises(RuntimeError, match="worker-node-1"):
         main._validate_worker_api_url_map_entries()
+
+
+def test_report_status_completed_for_v2_worker_does_not_mark_whole_batch(mock_db, caplog):
+    """协议 v2 节点逐文件回报时，未列出的任务必须保持 uploading，不能被整批标成功。"""
+    import logging
+
+    payload = {
+        "account_name": "baicai_1@1",
+        "status": "completed",
+        "successful_files": ["movie/test1.mp4"],
+    }
+
+    with patch.object(main, "get_worker_protocol_version", return_value=2), \
+         patch.object(main, "count_uploading_tasks", return_value=1), \
+         patch.object(main, "mark_all_uploading_tasks_success") as mock_mark_all:
+        with caplog.at_level(logging.WARNING):
+            response = client.post("/api/report_status", json=payload, headers=auth_headers())
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "success"}
+    mock_mark_all.assert_not_called()
+    assert any("保持 uploading" in record.getMessage() for record in caplog.records)
+
+
+def test_report_status_completed_for_v1_worker_keeps_batch_semantics(mock_db, caplog):
+    """旧协议节点不发送逐文件明细，保留整批语义并在日志里说明这是兼容路径。"""
+    import logging
+
+    payload = {
+        "account_name": "baicai_1@1",
+        "status": "completed",
+        "successful_files": [],
+    }
+
+    with patch.object(main, "get_worker_protocol_version", return_value=1), \
+         patch.object(main, "mark_all_uploading_tasks_success") as mock_mark_all:
+        with caplog.at_level(logging.WARNING):
+            response = client.post("/api/report_status", json=payload, headers=auth_headers())
+
+    assert response.status_code == 200
+    mock_mark_all.assert_called_once()
+    assert any("协议版本 <2" in record.getMessage() for record in caplog.records)

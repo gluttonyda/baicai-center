@@ -656,3 +656,42 @@ def test_dispatch_db_lock_is_held_during_run_and_released_after_exception(schema
     # 异常后仍可执行完整的真实调度 SQL（空库无节点时只做巡检）。
     assert main.dispatch_uploader_tasks() is True
     assert scalar(schema_db, "SELECT IS_FREE_LOCK(%s)", (lock_name,)) == 1
+
+
+def test_mark_successful_uploads_matches_normalized_paths(schema_db):
+    """库里存的是原始路径（可能带前导 / 或 ./），Worker 回报的是归一化路径，仍必须精确命中。"""
+    with schema_db.cursor() as cursor:
+        cursor.execute(
+            "INSERT INTO worker_registry (node_name, api_url, protocol_version, last_active) "
+            "VALUES ('worker-node-1', 'http://worker-node-1:8001/task/upload', 2, UTC_TIMESTAMP())"
+        )
+        cursor.execute(
+            "INSERT INTO drive_accounts (account_name, role, is_active) VALUES ('baicai_1@1', 'uploader', 1)"
+        )
+        for path in ("/movie/slash.mkv", "./movie/dot.mkv", "movie/plain.mkv", "movie/untouched.mkv"):
+            cursor.execute(
+                "INSERT INTO file_tasks (file_path, status, worker_node, account_used, size_bytes, dispatch_id) "
+                "VALUES (%s, 'uploading', 'worker-node-1', 'baicai_1@1', 10, NULL)",
+                (path,),
+            )
+
+    with schema_db.cursor() as cursor:
+        main.mark_successful_uploads_by_files(
+            cursor,
+            "baicai_1@1",
+            "staged",
+            ["movie/slash.mkv", "movie/dot.mkv", "movie/plain.mkv"],
+            None,
+        )
+
+    with schema_db.cursor() as cursor:
+        cursor.execute("SELECT file_path, status FROM file_tasks ORDER BY file_path")
+        statuses = {row["file_path"]: row["status"] for row in cursor.fetchall()}
+        cursor.execute("SELECT COUNT(*) AS events FROM account_upload_events")
+        events = cursor.fetchone()["events"]
+
+    assert statuses["/movie/slash.mkv"] == "staged"
+    assert statuses["./movie/dot.mkv"] == "staged"
+    assert statuses["movie/plain.mkv"] == "staged"
+    assert statuses["movie/untouched.mkv"] == "uploading"
+    assert events == 3

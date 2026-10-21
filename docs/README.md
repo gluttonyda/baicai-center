@@ -152,3 +152,4 @@ rm -f baicai-work/runtime/scanner_cache.db
 - Worker 本地缓存
 
 这些内容已在 [.gitignore](../.gitignore) 中排除。
+- [按文件标记上传成功说明](CODE_CHANGES_20261021_report_successful_files.md)
