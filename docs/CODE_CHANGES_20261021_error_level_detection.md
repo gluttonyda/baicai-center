@@ -23,9 +23,10 @@ INFO  : upload limit 2024.mkv: Copied (new)
 | 错误判定范围 | 每一行都判定 | 只有 `NOTICE`/`ERROR`/`CRITICAL`/`ALERT`/`EMERGENCY` 级别的行才判定；`INFO`/`DEBUG` 一律不判定 |
 | 双保险 | 无 | 已由 `parse_rclone_transfer_line` 识别成功的行（`Copied`/`Moved`/`Skipped`/`Deleted`）直接跳过错误判定 |
 | 无法识别级别 | — | 保留旧行为（整行匹配），避免 `--log-format` 差异导致漏判 |
+| rclone 日志格式 | 依赖节点默认值 | 命令里显式传 `--log-format date,time,level,msg`，把「级别可解析」这个前提固定下来 |
 | markers 列表 | 未变 | 未变（本次只改"在哪些行上判定"） |
 
-新增 `rclone_log_level()` / `is_error_level_line()` 两个辅助函数，日志级别正则兼容可选的日期时间前缀。
+新增 `rclone_log_level()` / `is_error_level_line()` 两个辅助函数，日志级别正则兼容可选的日期时间前缀。uploader 的 rclone 命令显式指定 `--log-format date,time,level,msg`：不指定时，节点上的 `RCLONE_LOG_FORMAT`、配置文件或 `RCLONE_USE_JSON_LOG` 可能改变分隔，使级别解析失败并回退成整行匹配（修复等于失效）。
 
 ## 兼容影响
 
@@ -35,7 +36,7 @@ INFO  : upload limit 2024.mkv: Copied (new)
 
 ## 测试
 
-在隔离环境（Python 3.10、MySQL 8.4.8、rclone v1.65.0）执行全量：**321 passed**，4 条 warning 均为既有 `on_event` 弃用提示。
+在隔离环境（Python 3.10、MySQL 8.4.8、rclone v1.65.0）执行全量：**332 passed**，4 条 warning 均为既有 `on_event` 弃用提示。
 
 新增用例：
 
@@ -43,6 +44,9 @@ INFO  : upload limit 2024.mkv: Copied (new)
 - `ERROR`/`NOTICE` 行（含 `User rate limit exceeded`、`invalid_grant`）→ 仍参与判定。
 - 无级别前缀的裸文本 `token expired` → 保留旧行为（判定为 True）。
 - 端到端风格：`run_uploader` 处理 `INFO  : token expired.mkv: Copied (new)` 时状态为 `completed`、该文件被记为成功、且没有出现"凭据失效"日志。
+- 正向端到端：`ERROR : movie/a.mkv: couldn't fetch token: invalid_grant` 仍会 kill 进程并回报 `credential_invalid`。
+- 回退契约参数化：带 PID 前缀、短横线日期、JSON 日志、只有时间前缀的四种格式都断言 `is_error_level_line(...) is True`。
+- 命令断言：uploader 的 rclone 参数里必须出现 `--log-format date,time,level,msg`。
 
 ## 残留风险
 

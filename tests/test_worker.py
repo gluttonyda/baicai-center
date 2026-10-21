@@ -1771,3 +1771,149 @@ def test_run_uploader_does_not_disable_account_for_filename_with_token_expired(c
     assert mock_report_status.call_args.args[1] == "completed"
     assert "token expired.mkv" in mock_report_status.call_args.args[2]
     assert not any("凭据失效" in record.getMessage() for record in caplog.records)
+
+
+def test_run_uploader_passes_explicit_log_format():
+    """错误级别判定依赖日志格式，命令里必须显式固定，避免节点环境改动导致回退。"""
+    class FakeStdout:
+        def readline(self):
+            return ""
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdout = FakeStdout()
+            self.returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeSelector:
+        def register(self, fileobj, event):
+            _ = (fileobj, event)
+
+        def unregister(self, fileobj):
+            _ = fileobj
+
+        def select(self, timeout=1.0):
+            _ = timeout
+            return []
+
+        def close(self):
+            return None
+
+    process = FakeProcess()
+    with patch("worker.resolve_task_path", return_value=("/dir1", "movie/a.mkv")), \
+         patch("worker.ALLOWED_BASE_DIRS", ["/dir1"]), \
+         patch("worker.subprocess.Popen", return_value=process) as mock_popen, \
+         patch("worker.selectors.DefaultSelector", return_value=FakeSelector()), \
+         patch("worker.tempfile.mkstemp", return_value=(1, "/tmp/a.txt")), \
+         patch("worker.os.fdopen") as mock_fdopen, \
+         patch("worker.os.path.exists", return_value=True), \
+         patch("worker.os.remove"), \
+         patch("worker.report_status"):
+        mock_fdopen.return_value.__enter__.return_value = MagicMock()
+        worker.run_uploader("baicai_1@1", ["movie/a.mkv"], "copy")
+
+    cmd = mock_popen.call_args.args[0]
+    assert "--log-format" in cmd
+    assert cmd[cmd.index("--log-format") + 1] == "date,time,level,msg"
+
+
+def test_run_uploader_treats_error_level_credential_failure_as_invalid(caplog):
+    """正向路径：ERROR 级别的 invalid_grant 仍要 kill 进程并回报 credential_invalid。"""
+    import logging
+
+    class FakeStdout:
+        def __init__(self, lines):
+            self._lines = list(lines)
+
+        def readline(self):
+            return self._lines.pop(0) if self._lines else ""
+
+    class FakeProcess:
+        def __init__(self, lines):
+            self.stdout = FakeStdout(lines)
+            self.returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeSelector:
+        def __init__(self, process):
+            self.process = process
+            self.registered = True
+
+        def register(self, fileobj, event):
+            _ = (fileobj, event)
+            self.registered = True
+
+        def unregister(self, fileobj):
+            _ = fileobj
+            self.registered = False
+
+        def select(self, timeout=1.0):
+            _ = timeout
+            if not self.registered:
+                return []
+            return [(SimpleNamespace(fileobj=self.process.stdout), None)]
+
+        def close(self):
+            return None
+
+    process = FakeProcess(
+        ["2026/10/21 10:00:00 ERROR : movie/a.mkv: couldn't fetch token: invalid_grant\n"]
+    )
+
+    with patch("worker.resolve_task_path", return_value=("/dir1", "movie/a.mkv")), \
+         patch("worker.ALLOWED_BASE_DIRS", ["/dir1"]), \
+         patch("worker.subprocess.Popen", return_value=process), \
+         patch("worker.selectors.DefaultSelector", return_value=FakeSelector(process)), \
+         patch("worker.tempfile.mkstemp", return_value=(1, "/tmp/a.txt")), \
+         patch("worker.os.fdopen") as mock_fdopen, \
+         patch("worker.os.path.exists", return_value=True), \
+         patch("worker.os.remove"), \
+         patch("worker.report_status") as mock_report_status:
+        mock_fdopen.return_value.__enter__.return_value = MagicMock()
+        with caplog.at_level(logging.WARNING):
+            worker.run_uploader("baicai_1@1", ["movie/a.mkv"], "copy")
+
+    assert mock_report_status.call_args.args[1] == "credential_invalid"
+    assert any("凭据失效" in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "12345 2026/10/21 10:00:00 ERROR : x: invalid_grant",   # 带 PID 前缀
+        "2026-10-21 10:00:00 ERROR : x: invalid_grant",         # 短横线日期
+        '{"level":"error","msg":"x: invalid_grant"}',           # JSON 日志
+        "10:00:00 ERROR : x: invalid_grant",                    # 只有时间前缀
+    ],
+)
+def test_unrecognized_formats_fall_back_to_legacy_detection(line):
+    """格式不认识时必须回退成旧行为（返回 True），宁可误判也不能漏判真实错误。"""
+    assert worker.is_error_level_line(line) is True
