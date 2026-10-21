@@ -2143,6 +2143,15 @@ def test_mark_successful_uploads_keeps_concurrency_guards():
     assert "account_used=%s" in update_sql
     assert "dispatch_id=%s" in update_sql
 
+    # 更新后再按「目标状态 + dispatch_id IS NULL」确认真正生效的 id，用量事件只按这些 id 记。
+    verify_sql = next(sql for sql in executed if "SELECT id FROM file_tasks" in sql)
+    assert "status=%s" in verify_sql
+    assert "dispatch_id IS NULL" in verify_sql
+
     event_sql = next(sql for sql in executed if "INSERT IGNORE INTO account_upload_events" in sql)
-    assert "status='uploading'" in event_sql
     assert "account_used=%s" in event_sql
+
+
+def test_normalize_relative_path_keeps_whitespace():
+    """首尾空白属于文件名（Issue #2），归一化不能 strip，否则 CI 无库时也能拦住回归。"""
+    assert main.normalize_relative_path(" leading/a.mkv ") == " leading/a.mkv "

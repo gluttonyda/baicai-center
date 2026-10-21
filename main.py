@@ -850,6 +850,9 @@ def _normalized_path_expression(column: str) -> str:
     return f"TRIM(LEADING '/' FROM REGEXP_REPLACE({column}, '^([.]/)+', ''))"
 
 
+RESOLVE_PATHS_CHUNK_SIZE = 500
+
+
 def resolve_successful_task_ids(
     cursor,
     account_name: str,
@@ -863,24 +866,38 @@ def resolve_successful_task_ids(
     """
     if not file_paths:
         return []
-    # 先去重：同一批回报里重复出现的路径只能认领一行，否则第二条会走归一化兜底把另一行也选中。
-    unique_paths = list(dict.fromkeys(file_paths))
-    normalized_paths = list(dict.fromkeys(normalize_relative_path(path) for path in unique_paths))
-    exact_placeholders = ",".join(["%s"] * len(unique_paths))
-    normalized_placeholders = ",".join(["%s"] * len(normalized_paths))
+    # 按归一值去重：同一批回报里重复或不同写法（a.mkv / ./a.mkv）的同一文件只能认领一行，
+    # 否则第二条会走归一化兜底，把从未上传的另一行也选中。
+    unique_paths: List[str] = []
+    seen_keys: set[str] = set()
+    for path in file_paths:
+        key = normalize_relative_path(path)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        unique_paths.append(path)
+
     task_condition, task_params = _task_dispatch_condition(dispatch_id)
-    cursor.execute(
-        f"""
-        SELECT id, file_path FROM file_tasks
-        WHERE account_used=%s
-          AND status='uploading'
-          AND {task_condition}
-          AND (file_path IN ({exact_placeholders})
-               OR {_normalized_path_expression("file_path")} IN ({normalized_placeholders}))
-        """,
-        [account_name] + task_params + unique_paths + normalized_paths,
-    )
-    rows = cursor.fetchall() or []
+    rows: List[dict] = []
+    # 分块查询：单条语句的占位符数量受 max_allowed_packet 限制，不能把整批塞进一个 IN。
+    for start in range(0, len(unique_paths), RESOLVE_PATHS_CHUNK_SIZE):
+        chunk = unique_paths[start:start + RESOLVE_PATHS_CHUNK_SIZE]
+        normalized_chunk = list(dict.fromkeys(normalize_relative_path(path) for path in chunk))
+        exact_placeholders = ",".join(["%s"] * len(chunk))
+        normalized_placeholders = ",".join(["%s"] * len(normalized_chunk))
+        cursor.execute(
+            f"""
+            SELECT id, file_path FROM file_tasks
+            WHERE account_used=%s
+              AND status='uploading'
+              AND {task_condition}
+              AND (file_path IN ({exact_placeholders})
+                   OR {_normalized_path_expression("file_path")} IN ({normalized_placeholders}))
+            ORDER BY id
+            """,
+            [account_name] + task_params + chunk + normalized_chunk,
+        )
+        rows.extend(cursor.fetchall() or [])
     candidates: dict[str, list[dict]] = {}
     for row in rows:
         candidates.setdefault(normalize_relative_path(row["file_path"]), []).append(row)
@@ -926,7 +943,6 @@ def record_upload_usage_events_for_task_ids(
             FROM file_tasks
             WHERE id IN ({format_strings})
               AND account_used=%s
-              AND status='uploading'
             """,
             [account_name, dispatch_id or "legacy"] + chunk + [account_name],
         )
@@ -958,7 +974,7 @@ def mark_successful_uploads_by_files(
     if not file_paths:
         return
     task_ids = resolve_successful_task_ids(cursor, account_name, file_paths, dispatch_id)
-    record_upload_usage_events_for_task_ids(cursor, account_name, task_ids, dispatch_id)
+    updated_ids: List[int] = []
     for start in range(0, len(task_ids), MAX_SUCCESSFUL_FILES):
         chunk = task_ids[start:start + MAX_SUCCESSFUL_FILES]
         format_strings = ",".join(["%s"] * len(chunk))
@@ -978,6 +994,18 @@ def mark_successful_uploads_by_files(
             """,
             [target_status] + chunk + [account_name] + task_params,
         )
+        # 只有真正被这次 UPDATE 改到的行才记用量，避免并发下为没更新成功的行记账。
+        cursor.execute(
+            f"""
+            SELECT id FROM file_tasks
+            WHERE id IN ({format_strings})
+              AND status=%s
+              AND dispatch_id IS NULL
+            """,
+            chunk + [target_status],
+        )
+        updated_ids.extend(int(row["id"]) for row in (cursor.fetchall() or []))
+    record_upload_usage_events_for_task_ids(cursor, account_name, updated_ids, dispatch_id)
 
 
 def count_uploading_tasks(cursor, account_name: str, dispatch_id: Optional[str]) -> int:

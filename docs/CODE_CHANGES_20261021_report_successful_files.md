@@ -47,7 +47,7 @@ rclone 只对实际动作的文件打日志行；漏搬、被跳过、或整批"
 
 ## 测试
 
-在隔离环境（Python 3.10、MySQL 8.4.8、rclone v1.65.0）执行全量：**339 passed**，非 root 同为 339 passed。
+在隔离环境（Python 3.10、MySQL 8.4.8、rclone v1.65.0）执行全量：**340 passed**，非 root 同为 340 passed。
 
 新增用例：
 
