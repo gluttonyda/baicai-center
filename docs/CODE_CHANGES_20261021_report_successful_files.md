@@ -14,7 +14,7 @@ rclone 只对实际动作的文件打日志行；漏搬、被跳过、或整批"
 | --- | --- | --- |
 | `status=="completed"` 的任务标记 | 一律整批置成功 | 协议 v2 节点：只认 `successful_files`（由既有"抢救"步骤精确标记），未列出的任务保持 `uploading`；协议 <2 或未知节点：保留整批语义并打 warning |
 | 用量事件 | 按整批插入 | v2 走 `insert_upload_usage_events_for_files`，只记实际成功的文件 |
-| 路径匹配 | `file_path IN (...)` 精确字符串比较 | SQL 侧归一化后比较：`TRIM(LEADING '/' FROM REGEXP_REPLACE(file_path, '^(\./)+', ''))`，即库里存的 `/movie/a.mkv`、`./movie/b.mkv` 与 Worker 回报的 `movie/a.mkv`、`movie/b.mkv` 都能命中 |
+| 路径匹配 | `file_path IN (...)` 精确字符串比较 | SQL 侧归一化后比较：`TRIM(LEADING '/' FROM REGEXP_REPLACE(file_path, '^([.]/)+', ''))`，即库里存的 `/movie/a.mkv`、`./movie/b.mkv` 与 Worker 回报的 `movie/a.mkv`、`movie/b.mkv` 都能命中 |
 
 ## 为什么未列出的任务保持 `uploading`
 
@@ -39,7 +39,9 @@ rclone 只对实际动作的文件打日志行；漏搬、被跳过、或整批"
 新增用例：
 
 - 单元：v2 节点回报 2/3 个文件时 `mark_all_uploading_tasks_success` 不被调用，并打"保持 uploading"警告；v1 节点仍走整批并打兼容警告。
-- 真库：库里存 `/movie/slash.mkv`、`./movie/dot.mkv`、`movie/plain.mkv`、`movie/untouched.mkv`，Worker 只回报前三个的归一化路径 → 前三条置 `staged`，第四条保持 `uploading`，用量事件恰好 3 条。
+- 真库：库里存 `/movie/slash.mkv`、`./movie/dot.mkv`、`movie/plain.mkv`、`a/movie.mkv`、`1/episode.mkv`、`x/holiday.mp4`、`holiday.mp4`、`movie/untouched.mkv`，Worker 只回报前七个的归一化路径 → 前七条置 `staged`，`movie/untouched.mkv` 保持 `uploading`，用量事件恰好 7 条。用例特意包含单字符开头的目录（`a/`、`1/`、`x/`），用于捕获 SQL 正则退化。
+
+> 踩坑记录：最初的正则写成转义点号（`^(\./)+`）。MySQL 字符串字面量默认按 C 转义解析，会吃掉这一层反斜杠，模式实际变成「任意字符 + `/`」重复，于是 `a/movie.mkv` 被归一成 `movie.mkv`，既漏匹配又可能误匹配。改用字符组 `[.]` 后不再需要任何反斜杠。
 
 ## 残留风险
 
