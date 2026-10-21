@@ -77,6 +77,15 @@ CACHE_DB_PATH
 
 如果 Center 数据库重置过，需要删除 Worker 缓存后重新扫描。
 
+
+## 镜像内的 rclone
+
+`baicai-work/Dockerfile` 直接安装官方 rclone 构建（当前固定 `1.65.2`，amd64/arm64/arm 分别校验 SHA256），不再使用发行版仓库里的 1.60.1——那个版本不接受含 `@` 的 remote 名，而现场账号名（`baicai_1@1`）都带 `@`。
+
+- 只有指向本机目录的 rclone 配置需要额外挂载（`/root/.config/rclone`）。
+- 宿主机 rclone 挂载（`/usr/bin/rclone`）**已不再必需**：新版节点可以直接删掉这一行；保留它只是为了让想固定宿主机版本的老节点行为不变。
+- CI 会在 `worker image (linux/amd64)` 与 `worker image (linux/arm64)` 两个 job 里断言版本 ≥ 1.65，并真的用 `rclone lsf "baicai_1@1:"` 解析一次带 `@` 的 remote，防止回退。
+
 ## rclone 行为
 
 Uploader 任务按来源根目录分组，调用 `rclone copy|move <来源根目录> <账号>:<目标目录> --files-from-raw <本批清单>`，只搬运本批文件。清单中是 `resolve_task_path` 规范化后的相对路径（见下文“路径安全”），逐行原样匹配：首尾空白、`#`/`;` 开头都是文件名的一部分，不做 glob。成功记录取自 rclone `INFO` 日志中 `Copied (…)`、`Deleted`、`Skipped` 行的对象路径，按原样回报。`move` 任务的文件在本地缺失时，用同一份 raw 清单对目标目录执行 `lsf`/`lsjson`，复核远端是否已存在。`--files-from-raw` 需要 rclone 1.52 或更高版本。以前使用 `--files-from` 时这类文件会被静默跳过，升级影响见 [uploader 改用 raw 清单说明](CODE_CHANGES_20261021_uploader_raw.md#兼容影响)。

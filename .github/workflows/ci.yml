@@ -172,26 +172,60 @@ jobs:
             baicai-center:ci -c "import main; print('import ok')"
 
   worker-image:
-    name: worker image
+    name: worker image (${{ matrix.platform }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            is_native: "true"
+          - platform: linux/arm64
+            is_native: "false"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # pinned: releases-v4 head
 
-      - name: Build Worker image
-        run: docker build -t baicai-worker:ci ./baicai-work
+      - name: Register QEMU for cross-platform build
+        if: matrix.is_native == 'false'
+        run: docker run --privileged --rm tonistiigi/binfmt:qemu-v7.0.0-28 --install arm64
 
-      - name: Report worker image rclone version
-        run: docker run --rm --entrypoint rclone baicai-worker:ci version | head -1
+      - name: Build Worker image
+        run: |
+          set -eux
+          docker build --platform ${{ matrix.platform }} -t baicai-worker:ci ./baicai-work
+
+      - name: Assert rclone version is >= 1.65
+        run: |
+          set -euo pipefail
+          # 不要在这里接 head：docker run 的输出被提前关闭会触发 SIGPIPE，配合 pipefail 会误判失败。
+          full_version=$(docker run --rm --platform ${{ matrix.platform }} --entrypoint rclone baicai-worker:ci version)
+          version=$(printf '%s\n' "$full_version" | head -1)
+          echo "$version"
+          # apt 的 1.60.1 不接受含 @ 的 remote 名，这里是防止回退的硬门槛。
+          echo "$version" | grep -Eq 'v1\.(6[5-9]|[7-9][0-9]|[1-9][0-9]{2})' || { echo "::error::镜像内 rclone 版本过低: $version"; exit 1; }
+
+      - name: Assert rclone accepts "@" in remote names
+        run: |
+          set -euo pipefail
+          workdir=$(mktemp -d)
+          mkdir -p "$workdir/remote"
+          touch "$workdir/remote/sample.mkv"
+          printf '[baicai_1@1]\ntype = alias\nremote = /tmp/remote\n' > "$workdir/rclone.conf"
+          docker run --rm --platform ${{ matrix.platform }} \
+            -v "$workdir/rclone.conf:/tmp/rclone.conf:ro" \
+            -v "$workdir/remote:/tmp/remote:ro" \
+            --entrypoint rclone baicai-worker:ci \
+            --config /tmp/rclone.conf lsf "baicai_1@1:" | tee /dev/stderr | grep -qx "sample.mkv"
 
       - name: Assert worker imports and has no unused dependencies
         run: |
-          docker run --rm --entrypoint python \
+          docker run --rm --platform ${{ matrix.platform }} --entrypoint python \
             -e NODE_TOKEN=test-node-token-at-least-32-characters \
             -e CENTER_URL=http://127.0.0.1:8080 \
             -e TARGET_REMOTE_DIR=probe \
             -e WORKER_NODE_NAME=probe-node \
             baicai-worker:ci -c "import worker; print('worker import ok')"
-          docker run --rm --entrypoint python \
+          docker run --rm --platform ${{ matrix.platform }} --entrypoint python \
             -e CENTER_API=http://127.0.0.1:8080/api \
             -e WORKER_API_URL=http://127.0.0.1:8001/task/upload \
             -e NODE_TOKEN=test-node-token-at-least-32-characters \
@@ -200,7 +234,7 @@ jobs:
             -e TASK_JOURNAL_DB_PATH=/tmp/baicai-ci/task_journal.db \
             -e CACHE_DB_PATH=/tmp/baicai-ci/scanner_cache.db \
             baicai-worker:ci -c "import scanner; print('scanner import ok')"
-          unexpected=$(docker run --rm --entrypoint python \
+          unexpected=$(docker run --rm --platform ${{ matrix.platform }} --entrypoint python \
             -e NODE_TOKEN=test-node-token-at-least-32-characters \
             -e CENTER_URL=http://127.0.0.1:8080 \
             -e TARGET_REMOTE_DIR=probe \
