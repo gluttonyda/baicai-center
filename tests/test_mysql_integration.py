@@ -805,3 +805,31 @@ def test_mark_successful_uploads_preserves_leading_whitespace(schema_db):
 
 def test_normalize_relative_path_keeps_whitespace():
     assert main.normalize_relative_path(" leading/a.mkv ") == " leading/a.mkv "
+
+
+def test_mark_successful_uploads_does_not_resurrect_not_found_rows(schema_db):
+    """并发路径已把行改成 not_found 时，成功回报不能把它复活成 staged。"""
+    with schema_db.cursor() as cursor:
+        cursor.execute(
+            "INSERT INTO worker_registry (node_name, api_url, protocol_version, last_active) "
+            "VALUES ('worker-node-1', 'http://worker-node-1:8001/task/upload', 2, UTC_TIMESTAMP())"
+        )
+        cursor.execute(
+            "INSERT INTO drive_accounts (account_name, role, is_active) VALUES ('baicai_1@1', 'uploader', 1)"
+        )
+        cursor.execute(
+            "INSERT INTO file_tasks (file_path, status, worker_node, account_used, size_bytes, dispatch_id) "
+            "VALUES ('movie/gone.mkv', 'not_found', 'worker-node-1', 'baicai_1@1', 10, NULL)"
+        )
+
+    with schema_db.cursor() as cursor:
+        main.mark_successful_uploads_by_files(cursor, "baicai_1@1", "staged", ["movie/gone.mkv"], None)
+
+    with schema_db.cursor() as cursor:
+        cursor.execute("SELECT status FROM file_tasks WHERE file_path='movie/gone.mkv'")
+        status = cursor.fetchone()["status"]
+        cursor.execute("SELECT COUNT(*) AS events FROM account_upload_events")
+        events = cursor.fetchone()["events"]
+
+    assert status == "not_found"
+    assert events == 0

@@ -2125,3 +2125,24 @@ def test_normalize_relative_path_strips_leading_dot_slash_and_slash():
     assert main.normalize_relative_path("./movie/dot.mkv") == "movie/dot.mkv"
     assert main.normalize_relative_path("/movie/slash.mkv") == "movie/slash.mkv"
     assert main.normalize_relative_path("movie/plain.mkv") == "movie/plain.mkv"
+
+
+def test_mark_successful_uploads_keeps_concurrency_guards():
+    """按 id 更新的同时必须保留状态/账号/dispatch 兜底，避免 check-then-act 覆盖并发变更。"""
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [{"id": 7, "file_path": "movie/a.mkv"}]
+
+    main.mark_successful_uploads_by_files(
+        cursor, "baicai_1@1", "staged", ["movie/a.mkv"], "d" * 32
+    )
+
+    executed = [call.args[0] for call in cursor.execute.call_args_list]
+    update_sql = next(sql for sql in executed if "UPDATE file_tasks" in sql)
+    assert "id IN (" in update_sql
+    assert "status='uploading'" in update_sql
+    assert "account_used=%s" in update_sql
+    assert "dispatch_id=%s" in update_sql
+
+    event_sql = next(sql for sql in executed if "INSERT IGNORE INTO account_upload_events" in sql)
+    assert "status='uploading'" in event_sql
+    assert "account_used=%s" in event_sql

@@ -47,12 +47,14 @@ rclone 只对实际动作的文件打日志行；漏搬、被跳过、或整批"
 
 ## 测试
 
-在隔离环境（Python 3.10、MySQL 8.4.8、rclone v1.65.0）执行全量：**336 passed**，非 root 同为 336 passed。
+在隔离环境（Python 3.10、MySQL 8.4.8、rclone v1.65.0）执行全量：**338 passed**，非 root 同为 338 passed。
 
 新增用例：
 
 - 单元：`_normalized_path_expression` 的 SQL 文本不含反斜杠（CI 无数据库时也能拦住正则退化），以及 `normalize_relative_path` 的前导 `/`、`./` 处理。
 - 单元：v2 节点回报 2/3 个文件时 `mark_all_uploading_tasks_success` 不被调用，并打"保持 uploading"警告；v1 节点仍走整批并打兼容警告。
+- 真库（并发兜底）：行已是 `not_found` 时，同一路径的成功回报不会把它复活成 `staged`，也不记用量事件。
+- 单元（SQL 契约）：按 id 更新与写用量事件时，SQL 里必须同时带 `status='uploading'` 与 `account_used=%s`（以及 dispatch 条件）。
 - 真库（一报一行）：`movie/x.mkv` 与 `/movie/x.mkv` 共存时，回报 `movie/x.mkv` 只让同名行成功，另一行保持 `uploading`，用量事件 1 条；回报 `/movie/y.mkv` 同样命中带斜杠那行。
 - 真库（空白）：` leading/movie.mkv` 原样回报能匹配成功；另有纯函数断言 `normalize_relative_path` 不裁剪空白。
 - 真库：库里存 `/movie/slash.mkv`、`./movie/dot.mkv`、`movie/plain.mkv`、`a/movie.mkv`、`1/episode.mkv`、`x/holiday.mp4`、`holiday.mp4`、`movie/untouched.mkv`，Worker 只回报前七个的归一化路径 → 前七条置 `staged`，`movie/untouched.mkv` 保持 `uploading`，用量事件恰好 7 条。用例特意包含单字符开头的目录（`a/`、`1/`、`x/`），用于捕获 SQL 正则退化。

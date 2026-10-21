@@ -923,8 +923,10 @@ def record_upload_usage_events_for_task_ids(
             SELECT %s, id, %s, COALESCE(size_bytes, 0), UTC_TIMESTAMP()
             FROM file_tasks
             WHERE id IN ({format_strings})
+              AND account_used=%s
+              AND status='uploading'
             """,
-            [account_name, dispatch_id or "legacy"] + chunk,
+            [account_name, dispatch_id or "legacy"] + chunk + [account_name],
         )
 
 
@@ -958,6 +960,9 @@ def mark_successful_uploads_by_files(
     for start in range(0, len(task_ids), MAX_SUCCESSFUL_FILES):
         chunk = task_ids[start:start + MAX_SUCCESSFUL_FILES]
         format_strings = ",".join(["%s"] * len(chunk))
+        task_condition, task_params = _task_dispatch_condition(dispatch_id)
+        # 只按 id 更新会丢掉并发兜底：解析与更新之间该行可能已被 not_found/pending 改走，
+        # 因此仍要断言状态、账号与 dispatch 归属。
         cursor.execute(
             f"""
             UPDATE file_tasks
@@ -965,8 +970,11 @@ def mark_successful_uploads_by_files(
                 dispatch_id=NULL,
                 updated_at=UTC_TIMESTAMP()
             WHERE id IN ({format_strings})
+              AND account_used=%s
+              AND status='uploading'
+              AND {task_condition}
             """,
-            [target_status] + chunk,
+            [target_status] + chunk + [account_name] + task_params,
         )
 
 
