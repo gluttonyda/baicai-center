@@ -13,7 +13,7 @@ rclone 只对实际动作的文件打日志行；漏搬、被跳过、或整批"
 | 范围 | 之前 | 现在 |
 | --- | --- | --- |
 | `status=="completed"` 的任务标记 | 一律整批置成功 | 协议 v2 节点：只认 `successful_files`（由既有"抢救"步骤精确标记），未列出的任务保持 `uploading`；协议 <2 或未知节点：保留整批语义并打 warning |
-| 用量事件 | 按整批插入 | v2 走 `insert_upload_usage_events_for_files`，只记实际成功的文件 |
+| 用量事件 | 按整批插入 | v2 在 UPDATE 生效后按实际更新的行调用 `record_upload_usage_events_for_task_ids`，只记成功的文件 |
 | 路径匹配 | `file_path IN (...)` 精确字符串比较 | SQL 侧归一化后比较：`TRIM(LEADING '/' FROM REGEXP_REPLACE(file_path, '^([.]/)+', ''))`，即库里存的 `/movie/a.mkv`、`./movie/b.mkv` 与 Worker 回报的 `movie/a.mkv`、`movie/b.mkv` 都能命中 |
 
 ## 一条回报只对应一行（跟进修复）

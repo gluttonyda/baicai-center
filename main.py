@@ -914,16 +914,6 @@ def resolve_successful_task_ids(
     return list(dict.fromkeys(chosen_ids))
 
 
-def insert_upload_usage_events_for_files(
-    cursor,
-    account_name: str,
-    file_paths: List[str],
-    dispatch_id: Optional[str] = None,
-):
-    task_ids = resolve_successful_task_ids(cursor, account_name, file_paths, dispatch_id)
-    record_upload_usage_events_for_task_ids(cursor, account_name, task_ids, dispatch_id)
-
-
 def record_upload_usage_events_for_task_ids(
     cursor,
     account_name: str,
