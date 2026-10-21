@@ -843,7 +843,8 @@ def normalize_relative_path(path: str) -> str:
 
 def _normalized_path_expression(column: str) -> str:
     """SQL 侧同样的归一化：先去掉开头的 ./ 序列，再裁掉前导 /。"""
-    return f"TRIM(LEADING '/' FROM REGEXP_REPLACE({column}, '^(\\./)+', ''))"
+    # 用 [.] 代替 \. ：MySQL 字符串字面量会吃掉单层反斜杠，导致模式退化。
+    return f"TRIM(LEADING '/' FROM REGEXP_REPLACE({column}, '^([.]/)+', ''))"
 
 
 def insert_upload_usage_events_for_files(
