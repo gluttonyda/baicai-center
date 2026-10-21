@@ -51,6 +51,7 @@ _DNS_PASSTHROUGH = {
 def stub_dispatch_dns(monkeypatch):
     """派发前会解析出站主机名并做地址分类；默认给一个真正的公网地址（93.184.216.34，非私有段），
     避免用例依赖真实 DNS，也避免"私有段默认放行"把 allowlist 之类的断言变成空测。
+    不能用 TEST-NET 文档段（如 203.0.113.0/24）：Python 的 ipaddress 把它们算作 is_private。
 
     需要真解析的主机（测试用 MySQL 容器）走透传；专测地址分类的用例在自己的 monkeypatch 里覆盖。
     """
@@ -61,7 +62,7 @@ def stub_dispatch_dns(monkeypatch):
         def fake_getaddrinfo(host, port, *args, **kwargs):
             if isinstance(host, str) and host in _DNS_PASSTHROUGH:
                 return real_getaddrinfo(host, port, *args, **kwargs)
-            return [(2, 1, 6, "", ("203.0.113.10", port if isinstance(port, int) else 80))]
+            return [(2, 1, 6, "", ("93.184.216.34", port if isinstance(port, int) else 80))]
 
         monkeypatch.setattr(main_module.socket, "getaddrinfo", fake_getaddrinfo)
     yield
