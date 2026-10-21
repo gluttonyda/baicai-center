@@ -27,6 +27,19 @@ from fastapi.testclient import TestClient
 client = TestClient(worker.app)
 
 
+@pytest.fixture(autouse=True)
+def _disable_remote_present_probe(monkeypatch):
+    """这些单元用例把 rclone 进程整体 mock 掉，额外的 lsjson 复核会打乱它们的调用序列。
+
+    远端存在性复核的真实行为由 tests/test_worker_integration.py 里的真 rclone 用例覆盖。
+    """
+    monkeypatch.setattr(
+        worker,
+        "skip_already_uploaded_files",
+        lambda account_name, base_dir, file_paths, remote_dir, mark_success, delete_local=False: file_paths,
+    )
+
+
 def test_resolve_task_path_rejects_path_traversal():
     assert worker.resolve_task_path("../etc/passwd") is None
 

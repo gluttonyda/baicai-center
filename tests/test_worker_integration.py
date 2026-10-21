@@ -291,3 +291,112 @@ def test_worker_rclone_move_recovers_special_filenames_already_on_remote(with_fi
         assert sorted(successful_files) == sorted(SPECIAL_UPLOAD_FILES)
         for relative_path in [*SPECIAL_UPLOAD_FILES, *UNLISTED_UPLOAD_FILES]:
             assert (staging_dir / relative_path).exists(), relative_path
+
+
+@requires_rclone
+def test_worker_rclone_marks_already_present_file_as_success():
+    """Issue #15：远端已存在且指纹一致的文件必须在本次回执里结算成功。
+
+    rclone 在 INFO 级别对这类文件不输出任何逐文件行，旧实现下它不会进入 successful_files，
+    Center 会每 UPLOADING_STALE_MINUTES 重派一次。
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        source_dir = tmp_path / "source"
+        uploader_root = tmp_path / "uploader"
+        dest_root = tmp_path / "dest"
+        config_path = tmp_path / "rclone.conf"
+        source_file = source_dir / "movie" / "sample.txt"
+        source_file.parent.mkdir(parents=True, exist_ok=True)
+        uploader_root.mkdir()
+        dest_root.mkdir()
+        source_file.write_text("hello worker", encoding="utf-8")
+
+        staged_file = uploader_root / worker.TARGET_REMOTE_DIR / "movie" / "sample.txt"
+        staged_file.parent.mkdir(parents=True)
+        shutil.copy2(source_file, staged_file)  # 同内容、同 mtime
+        staged_mtime = staged_file.stat().st_mtime_ns
+
+        write_rclone_config(config_path, uploader_root, dest_root)
+
+        with patch.dict(os.environ, {"RCLONE_CONFIG": str(config_path)}, clear=False), patch.object(worker, "ALLOWED_BASE_DIRS", [str(source_dir)]):
+            reports = []
+
+            def capture(account, status, successful_files=None, missing_files=None):
+                reports.append((account, status, successful_files or [], missing_files or []))
+
+            with patch("worker.report_status", side_effect=capture):
+                worker.run_uploader("baicai_1@1", ["movie/sample.txt"], "copy")
+
+            assert reports[-1] == ("baicai_1@1", "completed", ["movie/sample.txt"], [])
+            # 未被重新上传：mtime 保持不变（重传会写入新的 mtime）。
+            assert staged_file.stat().st_mtime_ns == staged_mtime
+
+
+@requires_rclone
+def test_worker_rclone_still_uploads_when_remote_copy_differs():
+    """指纹不一致（大小不同）时必须照常上传，不能因为"远端有同名文件"就跳过。"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        source_dir = tmp_path / "source"
+        uploader_root = tmp_path / "uploader"
+        dest_root = tmp_path / "dest"
+        config_path = tmp_path / "rclone.conf"
+        source_file = source_dir / "movie" / "sample.txt"
+        source_file.parent.mkdir(parents=True, exist_ok=True)
+        uploader_root.mkdir()
+        dest_root.mkdir()
+        source_file.write_text("hello worker", encoding="utf-8")
+
+        staged_file = uploader_root / worker.TARGET_REMOTE_DIR / "movie" / "sample.txt"
+        staged_file.parent.mkdir(parents=True)
+        staged_file.write_text("stale", encoding="utf-8")
+
+        write_rclone_config(config_path, uploader_root, dest_root)
+
+        with patch.dict(os.environ, {"RCLONE_CONFIG": str(config_path)}, clear=False), patch.object(worker, "ALLOWED_BASE_DIRS", [str(source_dir)]):
+            reports = []
+
+            def capture(account, status, successful_files=None, missing_files=None):
+                reports.append((account, status, successful_files or [], missing_files or []))
+
+            with patch("worker.report_status", side_effect=capture):
+                worker.run_uploader("baicai_1@1", ["movie/sample.txt"], "copy")
+
+            assert reports[-1] == ("baicai_1@1", "completed", ["movie/sample.txt"], [])
+            assert staged_file.read_text(encoding="utf-8") == "hello worker"
+
+
+@requires_rclone
+def test_worker_rclone_move_deletes_local_when_remote_already_present():
+    """""move""语义下，远端已存在且指纹一致的文件要记成功并清掉本地副本，否则会被扫描器重新入库。"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        source_dir = tmp_path / "source"
+        uploader_root = tmp_path / "uploader"
+        dest_root = tmp_path / "dest"
+        config_path = tmp_path / "rclone.conf"
+        source_file = source_dir / "movie" / "sample.txt"
+        source_file.parent.mkdir(parents=True, exist_ok=True)
+        uploader_root.mkdir()
+        dest_root.mkdir()
+        source_file.write_text("hello worker", encoding="utf-8")
+
+        staged_file = uploader_root / worker.TARGET_REMOTE_DIR / "movie" / "sample.txt"
+        staged_file.parent.mkdir(parents=True)
+        shutil.copy2(source_file, staged_file)
+
+        write_rclone_config(config_path, uploader_root, dest_root)
+
+        with patch.dict(os.environ, {"RCLONE_CONFIG": str(config_path)}, clear=False), patch.object(worker, "ALLOWED_BASE_DIRS", [str(source_dir)]):
+            reports = []
+
+            def capture(account, status, successful_files=None, missing_files=None):
+                reports.append((account, status, successful_files or [], missing_files or []))
+
+            with patch("worker.report_status", side_effect=capture):
+                worker.run_uploader("baicai_1@1", ["movie/sample.txt"], "move")
+
+            assert reports[-1] == ("baicai_1@1", "completed", ["movie/sample.txt"], [])
+            assert not source_file.exists()
+            assert staged_file.exists()

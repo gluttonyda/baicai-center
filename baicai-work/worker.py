@@ -651,6 +651,68 @@ def flush_cleaner_success_batch(account_name: str, status: str, batch: list[str]
         raise
 
 
+def skip_already_uploaded_files(
+    account_name: str,
+    base_dir: str,
+    file_paths: List[str],
+    remote_dir: Optional[str],
+    mark_success,
+    delete_local: bool = False,
+) -> List[str]:
+    """把远端已存在且指纹一致的文件记为成功，返回仍需要上传的文件。
+
+    依据 Issue #15：rclone 在 `--log-level INFO` 下对"目标端已存在"的文件不输出逐文件行，
+    这些文件不会进入 successful_files。这里用一次 lsjson 指纹复核把它们提前结算，
+    避免 Center 每 UPLOADING_STALE_MINUTES 重派同一批文件。
+
+    复核失败（rclone 出错/超时/格式异常）时返回原清单，退回"照常上传"。
+    """
+    if not file_paths:
+        return []
+
+    size_by_path: dict[str, int] = {}
+    mtime_by_path: dict[str, float] = {}
+    for file_path in file_paths:
+        try:
+            stat_result = os.stat(os.path.join(base_dir, file_path))
+        except OSError:
+            # 本地读不到（并发被删/权限），交给后面的上传流程按缺失处理。
+            continue
+        size_by_path[file_path] = stat_result.st_size
+        mtime_by_path[file_path] = stat_result.st_mtime
+
+    already_present = detect_remote_existing_files(
+        account_name,
+        file_paths,
+        size_by_path,
+        mtime_by_path,
+        remote_dir,
+    )
+    if not already_present:
+        return file_paths
+
+    for file_path in already_present:
+        mark_success(file_path)
+        # move 语义要求搬完后本地消失；rclone 对这种"跳过"的文件不会删本地，
+        # 留着会被扫描器当成新文件重新入库，形成慢速重复上传。
+        if delete_local:
+            local_path = os.path.realpath(os.path.join(base_dir, file_path))
+            base_real = os.path.realpath(base_dir)
+            if os.path.commonpath([local_path, base_real]) != base_real:
+                logger.warning("⚠️ [%s] 拒绝删除越界路径 %s", account_name, file_path)
+                continue
+            try:
+                os.remove(local_path)
+            except OSError as e:
+                logger.warning("⚠️ [%s] 远端已存在但删除本地文件失败 %s: %s", account_name, file_path, e)
+    logger.info(
+        "🩹 账号 [%s] 有 %s 个文件远端已存在且指纹一致，直接记为成功、不再重传。",
+        account_name,
+        len(already_present),
+    )
+    return [fp for fp in file_paths if fp not in already_present]
+
+
 def detect_remote_existing_files(
     account_name: str,
     file_paths: List[str],
@@ -1021,7 +1083,21 @@ def run_uploader(
     for base_dir, dir_files in tasks_by_dir.items():
         if not dir_files:
             continue
-        
+
+        # 远端已存在且指纹一致的文件先记成功并从清单里剔除：rclone 在 INFO 级别对这类文件
+        # 不输出任何逐文件日志（只有 DEBUG 才有 "Unchanged skipping"），若照常交给 rclone，
+        # 它们永远不会出现在 successful_files 里，会每 UPLOADING_STALE_MINUTES 被重派一次。
+        dir_files = skip_already_uploaded_files(
+            account_name,
+            base_dir,
+            dir_files,
+            task_remote_dir,
+            mark_success,
+            delete_local=(method == "move"),
+        )
+        if not dir_files:
+            continue
+
         # raw 清单逐行原样匹配：路径已拒绝 NUL/CR/LF，首尾空白和 #/; 开头都是文件名的一部分。
         fd, temp_path = tempfile.mkstemp(prefix="bc_up_", suffix=".txt")
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
