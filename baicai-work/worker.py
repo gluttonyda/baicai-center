@@ -433,6 +433,32 @@ RCLONE_TRANSFER_LOG_PATTERN = re.compile(
 )
 
 
+# rclone 日志行形如 "<日期> <时间> <LEVEL> : <对象>: <消息>"；LEVEL 可能是 DEBUG/INFO/NOTICE/ERROR。
+RCLONE_LOG_LEVEL_PATTERN = re.compile(
+    r"^\s*(?:\d{4}/\d{2}/\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?\s+)?"
+    r"(DEBUG|INFO|NOTICE|ERROR|CRITICAL|ALERT|EMERGENCY)\b"
+)
+ERROR_LEVELS = frozenset({"NOTICE", "ERROR", "CRITICAL", "ALERT", "EMERGENCY"})
+
+
+def rclone_log_level(line: str) -> Optional[str]:
+    match = RCLONE_LOG_LEVEL_PATTERN.match(line)
+    return match.group(1) if match else None
+
+
+def is_error_level_line(line: str) -> bool:
+    """只有错误级别的行才参与配额/凭据判定。
+
+    INFO 行会带完整对象路径（例如 "INFO  : token expired.mkv: Copied (new)"），
+    整行匹配会因文件名命中关键字而误封账号。无法识别级别的行保留旧行为（返回 True），
+    以免不同 rclone 版本/--log-format 导致漏判。
+    """
+    level = rclone_log_level(line)
+    if level is None:
+        return True
+    return level in ERROR_LEVELS
+
+
 def has_unsendable_characters(file_path: str) -> bool:
     """rclone 的 local backend 会把 C0/DEL 转义成可见符号（Tab→U+2409），原样清单匹配不到。"""
     return any(ord(char) < 32 or ord(char) == 127 for char in file_path)
@@ -1068,16 +1094,19 @@ def run_uploader(
                                     logger.warning("⏭️ [%s] 远端已存在或被 rclone 跳过: %s", account_name, file_path)
                                 mark_success(file_path)
 
-                            if is_credential_invalid_error(line):
-                                final_status = "credential_invalid"
-                                logger.warning(
-                                    "⛔ [%s] 命中凭据失效错误（invalid_grant/token expired），立即停用账号，等待人工 reconnect。",
-                                    account_name,
-                                )
-                                process.kill()
-                                break
-                            if is_quota_error(line):
-                                quota_detected = True
+                            # 只有错误级别的行才做配额/凭据判定：INFO 行含文件路径，
+                            # 路径里的 "token expired"/"upload limit" 会误封正常账号。
+                            if transfer is None and is_error_level_line(line):
+                                if is_credential_invalid_error(line):
+                                    final_status = "credential_invalid"
+                                    logger.warning(
+                                        "⛔ [%s] 命中凭据失效错误（invalid_grant/token expired），立即停用账号，等待人工 reconnect。",
+                                        account_name,
+                                    )
+                                    process.kill()
+                                    break
+                                if is_quota_error(line):
+                                    quota_detected = True
                         if final_status in ("403_quota", "credential_invalid"):
                             break
                 finally:
