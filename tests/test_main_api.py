@@ -2125,3 +2125,34 @@ def test_normalize_relative_path_strips_leading_dot_slash_and_slash():
     assert main.normalize_relative_path("./movie/dot.mkv") == "movie/dot.mkv"
     assert main.normalize_relative_path("/movie/slash.mkv") == "movie/slash.mkv"
     assert main.normalize_relative_path("movie/plain.mkv") == "movie/plain.mkv"
+
+
+def test_mark_successful_uploads_keeps_concurrency_guards():
+    """按 id 更新的同时必须保留状态/账号/dispatch 兜底，避免 check-then-act 覆盖并发变更。"""
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [{"id": 7, "file_path": "movie/a.mkv"}]
+
+    main.mark_successful_uploads_by_files(
+        cursor, "baicai_1@1", "staged", ["movie/a.mkv"], "d" * 32
+    )
+
+    executed = [call.args[0] for call in cursor.execute.call_args_list]
+    update_sql = next(sql for sql in executed if "UPDATE file_tasks" in sql)
+    assert "id IN (" in update_sql
+    assert "status='uploading'" in update_sql
+    assert "account_used=%s" in update_sql
+    assert "dispatch_id=%s" in update_sql
+
+    # 更新后再按「目标状态 + dispatch_id IS NULL」确认真正生效的 id，用量事件只按这些 id 记。
+    verify_sql = next(sql for sql in executed if "SELECT id FROM file_tasks" in sql)
+    assert "account_used=%s" in verify_sql
+    assert "status=%s" in verify_sql
+    assert "dispatch_id IS NULL" in verify_sql
+
+    event_sql = next(sql for sql in executed if "INSERT IGNORE INTO account_upload_events" in sql)
+    assert "account_used=%s" in event_sql
+
+
+def test_normalize_relative_path_keeps_whitespace():
+    """首尾空白属于文件名（Issue #2），归一化不能 strip，否则 CI 无库时也能拦住回归。"""
+    assert main.normalize_relative_path(" leading/a.mkv ") == " leading/a.mkv "

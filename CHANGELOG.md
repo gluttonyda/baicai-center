@@ -7,6 +7,7 @@
 - `status=completed` 的回执不再无条件整批置成功：协议 v2 节点只标记 `successful_files` 里的任务，未列出的任务保持 `uploading`，由既有租约超时机制回退重派并重试；`protocol_version < 2` 或未知节点保留整批语义并打 warning。
 - 上传用量事件随之按实际成功文件记录，不再按整批。
 - 成功文件的路径匹配改为 SQL 侧归一化（去掉前导 `/` 与 `./`），库里存 `/movie/a.mkv`、`./movie/b.mkv` 也能与 Worker 回报的 `movie/a.mkv`、`movie/b.mkv` 对上。
+- 跟进修复：一条回报只对应一行（`a.mkv` 与 `/a.mkv` 共存时不再互相认领），归一化不再 `strip()`（保留首尾空白，符合 Issue #2 的路径契约）。
 - 升级提示：v2 节点无需改动；若某次回执的成功清单为空但状态是 `completed`，该批不会被标记成功，会在 `UPLOADING_STALE_MINUTES`（默认 30 分钟）后重派。细节见 [按文件标记上传成功说明](docs/CODE_CHANGES_20261021_report_successful_files.md)。
 
 ## 2026-10-21 uploader 改用 raw 清单（Issue #2）
