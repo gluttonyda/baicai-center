@@ -1610,3 +1610,60 @@ def test_run_uploader_skips_control_character_paths_per_file(caplog):
     assert successful == ["movie/a.mkv"]
     assert missing == ["bad\ttab.mkv"]
     assert any("控制字符" in record.getMessage() for record in caplog.records)
+
+
+def test_run_cleaner_skips_control_character_paths_but_still_reports_clean_success(caplog):
+    """控制字符路径被排除出清单、只记 warning；Center 侧仍是整批 clean_success（见文档残留风险 9）。"""
+    import logging
+
+    class FakeStdout:
+        def readline(self):
+            return ""
+
+        def close(self):
+            return None
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdout = FakeStdout()
+            self.returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeSelector:
+        def register(self, fileobj, event):
+            _ = (fileobj, event)
+
+        def unregister(self, fileobj):
+            _ = fileobj
+
+        def select(self, timeout=1.0):
+            _ = timeout
+            return []
+
+        def close(self):
+            return None
+
+    process = FakeProcess()
+    with patch("worker.resolve_cleaner_destination_remote", return_value="baicai-big:staging"), \
+         patch("worker.subprocess.Popen", return_value=process), \
+         patch("worker.selectors.DefaultSelector", return_value=FakeSelector()), \
+         patch("worker.report_status") as mock_report_status:
+        with caplog.at_level(logging.WARNING):
+            worker.run_cleaner("baicai-1@1-3", "baicai-big", ["movie/a.mkv", "bad\ttab.mkv"])
+
+    assert mock_report_status.call_args.args[:2] == ("baicai-1@1-3", "clean_success")
+    assert any("控制字符" in record.getMessage() for record in caplog.records)

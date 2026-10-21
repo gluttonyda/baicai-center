@@ -1138,7 +1138,8 @@ def run_cleaner(
             logger.warning("🧹 [CLEAN-%s] 拒绝越界清理路径: %r", account_name, file_path)
             continue
         if has_unsendable_characters(file_path):
-            # 与 uploader 一致：rclone 会转义控制字符，清单写了也搬不动，显式暴露而不是静默成功。
+            # rclone 会转义控制字符，清单写了也搬不动；这里只做本地可见化（warning），
+            # Center 侧仍然按整批 clean_success 收尾，被跳过的文件会留在中转盘（见文档残留风险）。
             logger.warning("🧹 [CLEAN-%s] 跳过含控制字符的路径：%r", account_name, file_path)
             continue
         if normalized_path not in requested_files_seen:

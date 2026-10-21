@@ -47,7 +47,7 @@ INFO  : movie/name: Copied tricky.txt: Copied (new)
 - 路径仍由 `resolve_task_path` 生成：拒绝 NUL、CR、LF；去掉前导 `/` 后执行 `normpath`；拒绝 `..` 越界；按 `realpath` 核对 `ALLOWED_BASE_DIRS` 和来源根目录。不做 `strip`，也不改名。
 - **含控制字符的路径逐文件回执 `not_found`**（Tab、`\x07`、`\x7f` 等）：rclone 的 local backend 会把控制字符转义成符号（Tab→`␉` U+2409），清单里写真实 Tab 时目标端文件名被改写、甚至完全搬不动，而 rclone 仍返回 0。
   - 处理方式是**跳过单个文件 + 记 warning + 计入 `missing_files`**，而不是拒绝整个 payload。原因：`TaskPayload` 若整批返回 422，Center 会把整批任务打回 `pending` 并释放锁，下一个 60 秒周期又取到同一批、再次 422，该账号组会永久卡住（这是审查阶段发现的可用性回退，已修）。
-  - 取舍说明：这类文件用转义后的名字作为清单项其实可以上传成功（但目标端文件名会被改写），本轮选择"拒绝并显式回执"而不是"自动改名上传"，避免 Center 记录的路径与实际文件不一致。
+  - 取舍说明：实测把**转义后的名字**（如 `tab␉here.txt`）写进清单，rclone 能复制成功且目标端文件名保持原有的真实 Tab（只有日志/lsf 输出显示为转义形式）。但那需要 Worker 在生成清单和解析日志时做控制字符 ↔ U+240x 的双向映射，本轮没有做；当前选择"逐文件跳过并回执 not_found"，代价是这类文件暂时不会被搬运。
 - `--files-from-raw` 不做 glob：`glob*star.txt`、`br[ack]et.txt` 这类名字按字面搬运。旧 `--files-from` 内部同样走精确匹配（不展开 glob），所以这里没有语义损失，集成用例已锁定该行为。
 - 清单写入的是相对来源根目录的路径；远端复核时则是相对 `<账号>:<目标目录>` 的路径。两者的相对路径相同。
 - `--files-from-raw` 逐行原样匹配，只去掉行尾换行（rclone 按行读取并去掉行尾 `\r`），不做 glob。首尾空白、`#`/`;` 开头都算文件名的一部分。之所以继续拒绝 CR/LF，是因为它们会破坏“一行一个路径”。
@@ -66,7 +66,7 @@ INFO  : #hash.txt: Deleted
 INFO  : movie/name: Copied tricky.txt: Copied (new)
 ```
 
-解析规则：跳过 `INFO` 后的冒号和**一个**分隔空格，从这里开始贪婪匹配，直到行尾最后一个 `: <动作>` 之前的内容都算路径。动作只接受 `Copied`、`Copied (<括号说明>)`、`Skipped`、`Deleted`，与之前一致。`move` 模式下同一个文件会依次出现 `Copied (new)` 和 `Deleted` 两行，按路径去重。
+解析规则：跳过 `INFO` 后的冒号和**一个**分隔空格，从这里开始贪婪匹配，直到行尾最后一个 `: <动作>` 之前的内容都算路径。动作接受 `Copied`、`Copied (<括号说明>)`、`Moved`、`Moved (<括号说明>)`、`Skipped`、`Deleted`；其中 `Moved` 是本轮补上的（alias/local 之间 move 时 rclone 只输出 `Moved (server-side)`，旧集合会把它当成"没有记录"）。`move` 模式下同一个文件会依次出现 `Copied (new)` 和 `Deleted` 两行，按路径去重。
 
 我们没有改用 `--use-json-log`，原因有三点：
 
@@ -119,10 +119,10 @@ INFO  : movie/name: Copied tricky.txt: Copied (new)
 | 改正则，加临时诊断用例 | 同上 | copy/move 通过；lsjson 仍失败。诊断确认 `ModTime='2023-11-14T22:13:20.000000000Z'`，在 Python 3.10.20 下 `ValueError`（诊断用例已删除） |
 | 补 `ModTime` 单测后的全量 | `tests` | 3 failed, 303 passed（ModTime 单测、lsjson 集成用例、临时诊断用例） |
 | 全部完成 | `tests/test_worker_integration.py` | 8 passed |
-| 全部完成 | 全量 `tests` | 311 passed, 4 warnings, 0 skipped |
-| 全部完成 | 全量 `tests`，非 root | 311 passed, 6 warnings（多出的 2 条是非 root 无法写 `.pytest_cache` 的 `PytestCacheWarning`） |
+| 全部完成 | 全量 `tests` | 312 passed, 4 warnings, 0 skipped |
+| 全部完成 | 全量 `tests`，非 root | 312 passed, 6 warnings（多出的 2 条是非 root 无法写 `.pytest_cache` 的 `PytestCacheWarning`） |
 
-基线为 290 个，新增 21 个，合计 311 个（含控制字符逐文件跳过、`Moved` 识别、glob 字面量等用例）。4 条 warning 是 Worker 中原有的 FastAPI `on_event` 弃用提示，与基线相同。说明两点：日志解析单测在实现之前已经写好，但没有单独跑过红灯，正则的问题由上表第二阶段的真实 rclone 输出证明；全角空格用例是在全部转绿之后才加入的回归保护，没有观察过红灯，“它在旧实现下会被裁剪”这一判断依据的是 `strings.TrimSpace` 的语义。
+基线为 290 个，新增 22 个，合计 312 个（含控制字符逐文件跳过、`Moved` 识别、glob 字面量等用例）。4 条 warning 是 Worker 中原有的 FastAPI `on_event` 弃用提示，与基线相同。说明两点：日志解析单测在实现之前已经写好，但没有单独跑过红灯，正则的问题由上表第二阶段的真实 rclone 输出证明；全角空格用例是在全部转绿之后才加入的回归保护，没有观察过红灯，“它在旧实现下会被裁剪”这一判断依据的是 `strings.TrimSpace` 的语义。
 
 本地复现（需要 PATH 中有 rclone 1.65 或更高版本）：
 
@@ -140,3 +140,5 @@ PYTHONPATH=.:baicai-work pytest -q tests/test_worker_integration.py tests/test_w
 6. **整批成功（原有行为）。** 清单中的文件如果在 Worker 检查之后、rclone 执行之前被删除，rclone 对清单中不存在的源文件不报错（这一点依据 rclone 源码，未实测），Worker 回报 `completed`，Center 会把它和其他文件一起标为成功。
 7. **未在真实 Google Drive 上验证。** 集成用例使用 alias 指向本地目录。根据 rclone 文档，Drive 后端的默认编码只处理非法 UTF-8，不转义首尾空格和 `#`、`;`，这一点没有实测。
 8. `detect_cleaner_dest_existing_files` 已改为 raw，但它仍无任何调用方，属于候选删除项。
+9. **cleaner 被跳过文件的归宿。** `run_cleaner` 对含控制字符的路径只记 warning 并排除出清单，但仍回报 `clean_success`；Center 的 `complete_cleaner_dispatch_tasks` 会把该 dispatch 剩余 staged 全部置 `completed`，文件实际留在中转盘，且没有重试通道（`missing_files` 只对 `uploading` 行生效）。这条防线只保证"日志里看得到"，不保证状态一致。
+10. **`not_found` 无上限重排。** Center 的 `requeue_stale_not_found_tasks` 每 `NOT_FOUND_RETRY_MINUTES`（默认 60 分钟）把所有 `not_found` 改回 `pending`，没有尝试次数列。控制字符路径（以及其他确实不存在的文件）会被长期低频重派：占租约、每次再跳过并回执，直到人工处理。排障时不要误判为节点异常。
