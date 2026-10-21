@@ -30,6 +30,9 @@ def fake_dispatch_db_lock(request):
 import os
 import socket as _socket
 
+# 保存真实解析器：个别用例需要验证 glibc 对数字形式 IP 的解析行为（十进制/八进制/十六进制）。
+REAL_GETADDRINFO = _socket.getaddrinfo
+
 # 这些主机名要真实解析：真库用例靠它连测试用 MySQL 容器。
 _DNS_PASSTHROUGH = {
     host
@@ -62,3 +65,5 @@ def stub_dispatch_dns(monkeypatch):
 
         monkeypatch.setattr(main_module.socket, "getaddrinfo", fake_getaddrinfo)
     yield
+    if main_module is not None:
+        main_module._DNS_CACHE.clear()

@@ -2425,3 +2425,56 @@ def test_verify_dispatch_target_blocks_every_known_metadata_endpoint(api_url, la
             # 白名单批准也不能把元数据地址放出来。
             with pytest.raises(ValueError):
                 main.verify_dispatch_target(api_url, trusted_source=True)
+
+
+@pytest.mark.parametrize(
+    "api_url",
+    [
+        "http://2852039166/latest/meta-data/",          # 十进制整数形式的 169.254.169.254
+        "http://0xa9fea9fe/latest/meta-data/",          # 十六进制
+        "http://0251.0376.0251.0376/latest/meta-data/",  # 八进制
+        "http://169.254.169.254./latest/meta-data/",    # 末尾点
+    ],
+)
+def test_verify_dispatch_target_blocks_alternate_ip_literal_forms(api_url, monkeypatch):
+    """数值写法最终都会被解析成同一个地址，分类必须作用在解析结果上而不是字面量上。"""
+    from conftest import REAL_GETADDRINFO
+
+    monkeypatch.setattr(main.socket, "getaddrinfo", REAL_GETADDRINFO)
+    main._DNS_CACHE.clear()
+    with pytest.raises(ValueError):
+        main.verify_dispatch_target(api_url)
+
+
+def test_dns_resolution_timeout_is_fail_closed(monkeypatch):
+    """自报主机名指向黑洞 DNS 时不能再无限阻塞调度线程。"""
+    import threading as _threading
+
+    release = _threading.Event()
+
+    def _hang(*args, **kwargs):
+        release.wait(10)
+        return []
+
+    monkeypatch.setattr(main.socket, "getaddrinfo", _hang)
+    monkeypatch.setattr(main, "_DNS_RESOLVE_TIMEOUT_SECONDS", 0.2)
+    main._DNS_CACHE.clear()
+    try:
+        with pytest.raises(ValueError):
+            main.verify_dispatch_target("http://blackhole.invalid:8001/task/upload")
+    finally:
+        release.set()
+        main._DNS_CACHE.clear()
+
+
+def test_allowlist_does_not_bypass_metadata_addresses(monkeypatch):
+    """allowlist 只放开内网判定，元数据/回环仍然拒绝。"""
+    monkeypatch.setattr(main, "WORKER_API_ALLOWED_HOSTS", frozenset({"proxy.local"}))
+    monkeypatch.setattr(
+        main.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(2, 1, 6, "", ("169.254.169.254", 80))],
+    )
+    main._DNS_CACHE.clear()
+    with pytest.raises(ValueError):
+        main.verify_dispatch_target("http://proxy.local/latest/meta-data/")

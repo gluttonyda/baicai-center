@@ -27,8 +27,8 @@
 | 变量 | 默认 | 作用 |
 | --- | --- | --- |
 | `TRUST_SELF_REPORTED_WORKER_API_URL` | `true` | 空映射时是否信任节点自报地址。设 `false` 后所有节点必须在 `WORKER_API_URL_MAP` 里，否则拒绝派发（启动时打警告） |
-| `ALLOW_PRIVATE_WORKER_URLS` | `true` | 是否派发到 RFC1918/ULA。设 `false` 后只允许 `WORKER_API_URL_MAP` 里显式批准的地址（以及其他 `WORKER_API_ALLOWED_HOSTS` 主机），自报的内网地址一律拒绝 |
-| `WORKER_API_ALLOWED_HOSTS` | 空 | 逗号分隔的主机名白名单，命中后跳过地址分类（用于确实要访问内网/代理的受控场景） |
+| `ALLOW_PRIVATE_WORKER_URLS` | `true` | 是否派发到 RFC1918/ULA。设 `false` 后：自报的内网地址一律拒绝；`WORKER_API_URL_MAP` 里显式批准的地址仍可派发（管理员已批准）；公网地址不受影响 |
+| `WORKER_API_ALLOWED_HOSTS` | 空 | 逗号分隔的主机名，命中后只跳过"内网/非全局"这一档判定；回环、链路本地、元数据、组播、保留段仍然拒绝 |
 
 ### 启动一致性检查
 
@@ -49,7 +49,7 @@
 
 ## 测试
 
-- 全量：**391 passed, 0 skipped, 4 warnings**（真 MySQL 8.4.8 + 真实 rclone v1.65.0）。
+- 全量：**397 passed, 0 skipped, 4 warnings**（真 MySQL 8.4.8 + 真实 rclone v1.65.0）。
 - `tests/conftest.py` 新增 autouse fixture 为派发主机名提供稳定的测试解析结果（用真正的公网地址 `93.184.216.34`，否则"内网默认放行"会把 allowlist 之类的断言变成空测），并对测试用 MySQL 容器名透传真实解析。
 - 变异验证：删掉 `_verify_resolved_addresses` 里的 allowlist 短路后，`test_verify_dispatch_target_honours_allowlisted_host` 会失败（确认该用例不是空测）。
 
@@ -74,3 +74,6 @@
 - 内网地址默认放行是刻意取舍：容器网络部署必须如此。严格模式（`ALLOW_PRIVATE_WORKER_URLS=false`）下白名单里的地址仍可派发——因为那是管理员显式批准的；自报的内网地址则一律拒绝。
 - 启动日志会在"允许内网 + 信任自报 + 无白名单"三者同时成立时打警告：这是最敞开的组合。
 - 兼容认证不等于兼容完整 v1 调度，旧 Worker 的行为不变。
+- `getaddrinfo` 现在带 5 秒超时与 60 秒缓存：自报主机名指向黑洞 DNS 时不再拖住 60 秒周期的调度线程；超时按"无法解析"处理（跳过本次派发）。
+- 启动检查只统计仍活跃的节点（`last_active` 在 `WORKER_STALE_MINUTES` 内），避免列出早已失联的节点。
+- `.env.example` 与 README 已补上三个新开关和严格部署配方。

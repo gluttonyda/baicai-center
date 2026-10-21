@@ -153,6 +153,10 @@ def _env_flag(name: str, default: bool) -> bool:
     raw = os.getenv(name, "").strip().lower()
     if raw == "":
         return default
+    if raw not in ("0", "1", "false", "true", "no", "yes", "off", "on"):
+        # 拼错（flase/truee）会让安全开关静默取反，必须留痕，和 REQUIRE_WORKER_API_URL_MAP 的处理一致。
+        logger.warning("⚠️ %s 的取值 [%s] 无法识别，按 %s 处理；可用值为 true/false。", name, raw, default)
+        return default
     return raw in ("1", "true", "yes", "on")
 
 
@@ -205,6 +209,43 @@ _ALWAYS_BLOCKED_NETWORKS = tuple(
 )
 
 
+_DNS_CACHE: dict[tuple[str, int], tuple[float, list]] = {}
+_DNS_CACHE_TTL_SECONDS = 60.0
+_DNS_RESOLVE_TIMEOUT_SECONDS = 5.0
+
+
+def _getaddrinfo_with_timeout(host: str, port: int) -> list:
+    """带超时与短 TTL 缓存的解析。
+
+    主机名在空映射下由节点自报可控：指向黑洞 DNS 时，无超时的 getaddrinfo 会让每次派发阻塞数十秒，
+    把 60 秒周期的调度线程拖死。超时即视为不可用（fail-closed），缓存用来避免每轮重复解析。
+    """
+    key = (host, port)
+    now = time.monotonic()
+    cached = _DNS_CACHE.get(key)
+    if cached and now - cached[0] < _DNS_CACHE_TTL_SECONDS:
+        return cached[1]
+
+    result: dict[str, Optional[list]] = {}
+
+    def _resolve() -> None:
+        try:
+            result["infos"] = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except Exception as exc:  # 交回调用方按"无法解析"处理
+            result["error"] = exc
+
+    worker = threading.Thread(target=_resolve, name=f"dns-{host}", daemon=True)
+    worker.start()
+    worker.join(_DNS_RESOLVE_TIMEOUT_SECONDS)
+    if worker.is_alive():
+        raise socket.gaierror(f"解析 {host} 超时")
+    if "error" in result:
+        raise result["error"]
+    infos = result.get("infos") or []
+    _DNS_CACHE[key] = (now, infos)
+    return infos
+
+
 def _blocked_address_reason(
     ip: "ipaddress.IPv4Address | ipaddress.IPv6Address",
     allow_private: bool = False,
@@ -235,20 +276,21 @@ def _blocked_address_reason(
 
 
 def _verify_resolved_addresses(host: str, port: int, allow_private: bool = False) -> None:
-    if host.lower() in WORKER_API_ALLOWED_HOSTS:
-        return
+    # allowlist 只放开"内网/非全局"这一档：回环、链路本地、元数据、组播、保留段一律仍然拒绝，
+    # 否则运维写一个宽松主机名就等于整体关掉策略。
+    host_allowlisted = host.lower() in WORKER_API_ALLOWED_HOSTS
     try:
         literal = ipaddress.ip_address(host)
     except ValueError:
         literal = None
     if literal is not None:
-        reason = _blocked_address_reason(literal, allow_private=allow_private)
+        reason = _blocked_address_reason(literal, allow_private=allow_private or host_allowlisted)
         if reason:
             raise ValueError(f"worker_api_url 指向被拒绝的地址（{reason}）")
         return
 
     try:
-        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        infos = _getaddrinfo_with_timeout(host, port)
     except socket.gaierror as exc:
         raise ValueError("worker_api_url 的主机名无法解析") from exc
     addresses = {info[4][0] for info in infos}
@@ -259,7 +301,7 @@ def _verify_resolved_addresses(host: str, port: int, allow_private: bool = False
             ip = ipaddress.ip_address(address)
         except ValueError:
             raise ValueError("worker_api_url 解析出无法识别的地址")
-        reason = _blocked_address_reason(ip, allow_private=allow_private)
+        reason = _blocked_address_reason(ip, allow_private=allow_private or host_allowlisted)
         if reason:
             raise ValueError(f"worker_api_url 解析到被拒绝的地址（{reason}）")
 
@@ -545,7 +587,13 @@ def resolve_dispatch_api_url(worker_node: str, registered_api_url: str) -> Optio
             resolve_worker_api_url(worker_node, registered_api_url), trusted_source=trusted
         )
     except HTTPException:
-        logger.warning("⏭️ 节点 [%s] 未在 WORKER_API_URL_MAP 白名单中，跳过本次派发。", worker_node)
+        if WORKER_API_URL_MAP and worker_node not in WORKER_API_URL_MAP:
+            logger.warning("⏭️ 节点 [%s] 未在 WORKER_API_URL_MAP 白名单中，跳过本次派发。", worker_node)
+        else:
+            logger.warning(
+                "⏭️ 节点 [%s] 没有获批的派发地址（白名单为空且 TRUST_SELF_REPORTED_WORKER_API_URL=false），跳过本次派发。",
+                worker_node,
+            )
     except ValueError as exc:
         # 不记录原始地址：历史记录里可能带 user:password@。
         logger.warning("⏭️ 节点 [%s] 的 api_url 不可用（%s），跳过本次派发。", worker_node, exc)
@@ -1960,7 +2008,12 @@ def log_worker_api_url_map_gaps() -> None:
         return
     try:
         with db.cursor() as cursor:
-            cursor.execute("SELECT node_name, api_url FROM worker_registry")
+            cursor.execute(
+                "SELECT node_name, api_url FROM worker_registry "
+                "WHERE last_active > DATE_SUB(UTC_TIMESTAMP(), INTERVAL %s MINUTE) "
+                "AND node_name != 'Init_Scanner'",
+                (WORKER_STALE_MINUTES,),
+            )
             rows = cursor.fetchall() or []
     except Exception as exc:
         logger.warning("⚠️ 检查节点白名单覆盖情况失败: %s", exc)

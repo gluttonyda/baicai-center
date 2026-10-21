@@ -328,6 +328,8 @@ PYTHONPATH=.:baicai-work pytest -q tests/test_mysql_integration.py
 
 白名单非空时，uploader 和 cleaner 每次派发前都会按当前映射重新解析 `worker_registry` 中的地址，修改映射后不必等节点重新上报；名单外节点跳过派发并记录 warning。上报的 `worker_api_url` 和映射中的地址都必须是 `http://` 或 `https://`，不允许 `user:password@`、空主机名、非法端口或空白/控制字符；内网主机名、IP 和自定义端口（如 `http://worker-node-1:8001/task/upload`）不受影响。详见 [变更说明](docs/CODE_CHANGES_20261021_dispatch_url.md)。
 
+派发前还会**复核实际地址**：每次派发重新解析主机名（5 秒超时 + 60 秒缓存），拒绝回环、链路本地、各云厂商元数据地址（`169.254.169.254`、`100.100.100.200`、`fd00:ec2::254`、`fd20:ce::254`、`192.0.0.192` 等）、组播、保留段；任一解析结果被拒即跳过本次派发，解析失败也跳过（不 fail-open）。三个开关控制姿态：`TRUST_SELF_REPORTED_WORKER_API_URL`（空映射时是否信任自报地址）、`ALLOW_PRIVATE_WORKER_URLS`（是否允许 RFC1918/ULA，默认允许——容器网络需要）、`WORKER_API_ALLOWED_HOSTS`（显式批准的主机名，只放开内网判定）。严格部署推荐：`WORKER_API_URL_MAP` 覆盖全部节点 + `REQUIRE_WORKER_API_URL_MAP=true` + `TRUST_SELF_REPORTED_WORKER_API_URL=false` + `ALLOW_PRIVATE_WORKER_URLS=false`。详见 [出站策略说明](docs/CODE_CHANGES_20261022_worker_url_egress.md)。
+
 ## 文档
 
 - [文档索引](docs/README.md)
