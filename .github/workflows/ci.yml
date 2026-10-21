@@ -197,7 +197,9 @@ jobs:
       - name: Assert rclone version is >= 1.65
         run: |
           set -euo pipefail
-          version=$(docker run --rm --platform ${{ matrix.platform }} --entrypoint rclone baicai-worker:ci version | head -1)
+          # 不要在这里接 head：docker run 的输出被提前关闭会触发 SIGPIPE，配合 pipefail 会误判失败。
+          full_version=$(docker run --rm --platform ${{ matrix.platform }} --entrypoint rclone baicai-worker:ci version)
+          version=$(printf '%s\n' "$full_version" | head -1)
           echo "$version"
           # apt 的 1.60.1 不接受含 @ 的 remote 名，这里是防止回退的硬门槛。
           echo "$version" | grep -Eq 'v1\.(6[5-9]|[7-9][0-9]|[1-9][0-9]{2})' || { echo "::error::镜像内 rclone 版本过低: $version"; exit 1; }
