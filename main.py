@@ -1,9 +1,11 @@
 import json
 import hashlib
 import hmac
+import ipaddress
 import logging
 import os
 import re
+import socket
 import threading
 import time
 import uuid
@@ -145,6 +147,179 @@ if not WORKER_API_URL_MAP:
         "⚠️ WORKER_API_URL_MAP 为空：Center 将信任节点上报的 worker_api_url 并向其派发请求；"
         "生产环境应配置白名单并设置 REQUIRE_WORKER_API_URL_MAP=true。"
     )
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if raw == "":
+        return default
+    if raw not in ("0", "1", "false", "true", "no", "yes", "off", "on"):
+        # 拼错（flase/truee）会让安全开关静默取反，必须留痕，和 REQUIRE_WORKER_API_URL_MAP 的处理一致。
+        logger.warning("⚠️ %s 的取值 [%s] 无法识别，按 %s 处理；可用值为 true/false。", name, raw, default)
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
+# 空映射时是否信任节点自报的 worker_api_url。默认保持兼容（true），严格部署可设 false，
+# 此时所有节点必须出现在 WORKER_API_URL_MAP 里。
+TRUST_SELF_REPORTED_WORKER_API_URL = _env_flag("TRUST_SELF_REPORTED_WORKER_API_URL", True)
+# 是否允许派发到 RFC1918/ULA 内网地址。容器网络里的 worker 就是内网地址，默认允许；
+# 回环、链路本地（含 169.254.169.254 云元数据）、组播、保留地址始终拒绝。
+ALLOW_PRIVATE_WORKER_URLS = _env_flag("ALLOW_PRIVATE_WORKER_URLS", True)
+# 显式批准的主机名（逗号分隔）：命中后跳过地址分类，用于确实需要访问内网/环回的受控场景。
+WORKER_API_ALLOWED_HOSTS = frozenset(
+    host.strip().lower()
+    for host in os.getenv("WORKER_API_ALLOWED_HOSTS", "").split(",")
+    if host.strip()
+)
+
+if not TRUST_SELF_REPORTED_WORKER_API_URL and not WORKER_API_URL_MAP:
+    logger.warning(
+        "🔒 TRUST_SELF_REPORTED_WORKER_API_URL=false 且 WORKER_API_URL_MAP 为空：所有节点都未获批地址，"
+        "本轮起不会向任何节点派发请求。"
+    )
+if ALLOW_PRIVATE_WORKER_URLS:
+    logger.info("🔓 ALLOW_PRIVATE_WORKER_URLS=true：允许派发到内网地址（容器网络部署需要）。")
+if ALLOW_PRIVATE_WORKER_URLS and TRUST_SELF_REPORTED_WORKER_API_URL and not WORKER_API_URL_MAP:
+    logger.warning(
+        "⚠️ 当前同时允许内网地址、信任节点自报地址、且没有白名单：持有节点令牌的一方可以让 Center "
+        "向任意内网地址 POST 任务。收紧方式：配置 WORKER_API_URL_MAP（白名单地址即使 ALLOW_PRIVATE_WORKER_URLS=false 也可派发）。"
+    )
+
+
+# 这些网段无论开关怎么设都拒绝。Python 的 is_private/is_reserved 不覆盖它们，
+# 但其中就有云厂商的元数据地址：阿里云 100.100.100.200 落在 CGNAT 100.64.0.0/10，
+# Oracle/IBM 等用 192.0.0.0/24 里的地址，命中即等于把节点凭据/任务信息送到元数据服务。
+_ALWAYS_BLOCKED_NETWORKS = tuple(
+    ipaddress.ip_network(network)
+    for network in (
+        "0.0.0.0/8",       # Linux 会把到 0/8 的连接路由到本机，等价回环（除 0.0.0.0 外的地址也要拦）
+        "100.64.0.0/10",   # CGNAT / 共享地址空间（含阿里云元数据 100.100.100.200）
+        "192.0.0.0/24",    # IETF 协议分配（含 Oracle 元数据 192.0.0.192）
+        "198.18.0.0/15",   # 基准测试保留段
+        "240.0.0.0/4",     # 保留
+        "168.63.129.16/32",  # Azure WireServer / 平台虚拟 IP
+        "169.254.170.2/32",  # ECS 任务元数据端点
+        "255.255.255.255/32",
+        "fd00:ec2::/32",   # AWS IMDS 的 IPv6 地址 fd00:ec2::254（169.254.169.254 的 IPv6 对应物）
+        "fd20:ce::/32",    # GCP 的 IPv6 元数据端点 fd20:ce::254
+        "100::/64",        # IPv6 丢弃段
+        "2001:db8::/32",   # 文档用段
+    )
+)
+
+
+_DNS_CACHE: dict[tuple[str, int], tuple[float, list]] = {}
+_DNS_CACHE_TTL_SECONDS = 60.0
+_DNS_RESOLVE_TIMEOUT_SECONDS = 5.0
+
+
+def _getaddrinfo_with_timeout(host: str, port: int) -> list:
+    """带超时与短 TTL 缓存的解析。
+
+    主机名在空映射下由节点自报可控：指向黑洞 DNS 时，无超时的 getaddrinfo 会让每次派发阻塞数十秒，
+    把 60 秒周期的调度线程拖死。超时即视为不可用（fail-closed），缓存用来避免每轮重复解析。
+    """
+    key = (host, port)
+    now = time.monotonic()
+    cached = _DNS_CACHE.get(key)
+    if cached and now - cached[0] < _DNS_CACHE_TTL_SECONDS:
+        return cached[1]
+
+    result: dict[str, Optional[list]] = {}
+
+    def _resolve() -> None:
+        try:
+            result["infos"] = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except Exception as exc:  # 交回调用方按"无法解析"处理
+            result["error"] = exc
+
+    worker = threading.Thread(target=_resolve, name=f"dns-{host}", daemon=True)
+    worker.start()
+    worker.join(_DNS_RESOLVE_TIMEOUT_SECONDS)
+    if worker.is_alive():
+        raise socket.gaierror(f"解析 {host} 超时")
+    if "error" in result:
+        raise result["error"]
+    infos = result.get("infos") or []
+    _DNS_CACHE[key] = (now, infos)
+    return infos
+
+
+def _blocked_address_reason(
+    ip: "ipaddress.IPv4Address | ipaddress.IPv6Address",
+    allow_private: bool = False,
+) -> Optional[str]:
+    """按地址类型给出拒绝原因；返回 None 表示允许。"""
+    # ::ffff:100.100.100.200 这类 IPv4 映射地址要先还原成 IPv4 再分类，
+    # 否则 Python ≥3.13 会把它当成普通 IPv6 地址（不同版本行为还不一致）。
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+
+    for network in _ALWAYS_BLOCKED_NETWORKS:
+        if ip.version == network.version and ip in network:
+            return f"禁用网段 {network}"
+
+    if ip.is_loopback:
+        return "回环地址"
+    if ip.is_link_local:
+        return "链路本地地址（含云元数据 169.254.169.254）"
+    if ip.is_multicast:
+        return "组播地址"
+    if ip.is_unspecified:
+        return "未指定地址（0.0.0.0/::）"
+    if getattr(ip, "is_reserved", False):
+        return "保留地址"
+    if ip.is_private and not (ALLOW_PRIVATE_WORKER_URLS or allow_private):
+        return "内网地址（ALLOW_PRIVATE_WORKER_URLS=false 且该地址不在 WORKER_API_URL_MAP 里）"
+    return None
+
+
+def _verify_resolved_addresses(host: str, port: int, allow_private: bool = False) -> None:
+    # allowlist 只放开"内网/非全局"这一档：回环、链路本地、元数据、组播、保留段一律仍然拒绝，
+    # 否则运维写一个宽松主机名就等于整体关掉策略。
+    host_allowlisted = host.lower() in WORKER_API_ALLOWED_HOSTS
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        reason = _blocked_address_reason(literal, allow_private=allow_private or host_allowlisted)
+        if reason:
+            raise ValueError(f"worker_api_url 指向被拒绝的地址（{reason}）")
+        return
+
+    try:
+        infos = _getaddrinfo_with_timeout(host, port)
+    except socket.gaierror as exc:
+        raise ValueError("worker_api_url 的主机名无法解析") from exc
+    addresses = {info[4][0] for info in infos}
+    if not addresses:
+        raise ValueError("worker_api_url 的主机名没有解析出任何地址")
+    for address in addresses:
+        try:
+            ip = ipaddress.ip_address(address)
+        except ValueError:
+            raise ValueError("worker_api_url 解析出无法识别的地址")
+        reason = _blocked_address_reason(ip, allow_private=allow_private or host_allowlisted)
+        if reason:
+            raise ValueError(f"worker_api_url 解析到被拒绝的地址（{reason}）")
+
+
+def verify_dispatch_target(api_url: str, trusted_source: bool = False) -> str:
+    """派发前复核出站目标的实际地址。
+
+    worker_api_url 会来自节点自报或历史注册记录，格式合法不等于可以连：这里在每次派发前
+    （重新）解析主机名并拒绝回环/链路本地/元数据等地址，同时降低 DNS 记录被事后改写的风险。
+    解析与真正建立连接之间仍有 TOCTOU 窗口，彻底缓解需要出口网络策略配合。
+    """
+    parts = urlsplit(api_url)
+    host = parts.hostname
+    if not host:
+        raise ValueError("worker_api_url 缺少主机名")
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    _verify_resolved_addresses(host, port, allow_private=trusted_source)
+    return api_url
 
 
 def _load_worker_token_map() -> dict[str, str]:
@@ -395,15 +570,30 @@ def resolve_worker_api_url(worker_node: str, reported_api_url: str) -> str:
     if WORKER_API_URL_MAP:
         raise HTTPException(status_code=400, detail=f"worker_node [{worker_node}] 未在白名单中注册")
 
+    if not TRUST_SELF_REPORTED_WORKER_API_URL:
+        raise HTTPException(
+            status_code=400,
+            detail=f"worker_node [{worker_node}] 未在白名单中注册，且当前部署不信任节点自报地址",
+        )
+
     return validate_api_url(reported_api_url)
 
 
 def resolve_dispatch_api_url(worker_node: str, registered_api_url: str) -> Optional[str]:
-    """派发前按当前白名单重新解析 worker_registry 中的地址；不可派发时记 warning 并返回 None。"""
+    """派发前按当前白名单重新解析 worker_registry 中的地址并复核实际地址；不可派发时记 warning 并返回 None。"""
     try:
-        return resolve_worker_api_url(worker_node, registered_api_url)
+        trusted = worker_node in WORKER_API_URL_MAP
+        return verify_dispatch_target(
+            resolve_worker_api_url(worker_node, registered_api_url), trusted_source=trusted
+        )
     except HTTPException:
-        logger.warning("⏭️ 节点 [%s] 未在 WORKER_API_URL_MAP 白名单中，跳过本次派发。", worker_node)
+        if WORKER_API_URL_MAP and worker_node not in WORKER_API_URL_MAP:
+            logger.warning("⏭️ 节点 [%s] 未在 WORKER_API_URL_MAP 白名单中，跳过本次派发。", worker_node)
+        else:
+            logger.warning(
+                "⏭️ 节点 [%s] 没有获批的派发地址（白名单为空且 TRUST_SELF_REPORTED_WORKER_API_URL=false），跳过本次派发。",
+                worker_node,
+            )
     except ValueError as exc:
         # 不记录原始地址：历史记录里可能带 user:password@。
         logger.warning("⏭️ 节点 [%s] 的 api_url 不可用（%s），跳过本次派发。", worker_node, exc)
@@ -1564,6 +1754,8 @@ def _dispatch_uploader_tasks_locked():
                             content=raw_body,
                             headers=request_headers,
                             timeout=10.0,
+                            # 派发不跟随重定向：重定向目标不受地址白名单与地址分类约束。
+                            follow_redirects=False,
                         )
                         response.raise_for_status()
                         logger.info(f"🚀 节点 [{node_name}]：分配账号 {account_name} 搬运 {len(batch_tasks)} 个文件 (模式: {first_method})")
@@ -1766,6 +1958,8 @@ def dispatch_cleaner_tasks(force_all=False):
                             content=raw_body,
                             headers=request_headers,
                             timeout=10.0,
+                            # 派发不跟随重定向：重定向目标不受地址白名单与地址分类约束。
+                            follow_redirects=False,
                         )
                         response.raise_for_status()
                         logger.info(
@@ -1803,6 +1997,39 @@ def dispatch_cleaner_tasks(force_all=False):
     finally:
         db.close()
 
+def log_worker_api_url_map_gaps() -> None:
+    """启动时提示活跃节点与白名单的不一致，避免"改了映射但旧节点还在自报地址"这种情况被忽略。"""
+    if not WORKER_API_URL_MAP:
+        return
+    try:
+        db = get_db_connection()
+    except Exception as exc:  # 启动阶段数据库可能还没就绪，不能因此起不来
+        logger.warning("⚠️ 无法连接数据库检查节点白名单覆盖情况: %s", exc)
+        return
+    try:
+        with db.cursor() as cursor:
+            cursor.execute(
+                "SELECT node_name, api_url FROM worker_registry "
+                "WHERE last_active > DATE_SUB(UTC_TIMESTAMP(), INTERVAL %s MINUTE) "
+                "AND node_name != 'Init_Scanner'",
+                (WORKER_STALE_MINUTES,),
+            )
+            rows = cursor.fetchall() or []
+    except Exception as exc:
+        logger.warning("⚠️ 检查节点白名单覆盖情况失败: %s", exc)
+        return
+    finally:
+        db.close()
+
+    missing = [row["node_name"] for row in rows if row["node_name"] not in WORKER_API_URL_MAP]
+    if missing:
+        logger.warning(
+            "⚠️ 有 %s 个已注册节点不在 WORKER_API_URL_MAP 中，本次派发会被跳过: %s",
+            len(missing),
+            ", ".join(sorted(missing)[:10]),
+        )
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     scheduler = BackgroundScheduler(timezone=SCHEDULER_TIMEZONE)
@@ -1813,6 +2040,7 @@ async def lifespan(_app: FastAPI):
     else:
         logger.warning("🧹 Cleaner dispatch is disabled by CLEANER_DISPATCH_ENABLED=false.")
     scheduler.start()
+    log_worker_api_url_map_gaps()
     yield
     scheduler.shutdown()
 

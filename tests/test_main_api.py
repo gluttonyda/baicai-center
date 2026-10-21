@@ -2225,3 +2225,260 @@ def test_report_status_request_rejects_already_present_outside_successful_files(
             successful_files=["movie/a.mkv"],
             already_present_files=["movie/b.mkv"],
         )
+
+
+# ===== 出站地址策略（Issue #1） =====
+
+
+@pytest.mark.parametrize(
+    "api_url",
+    [
+        "http://127.0.0.1:8001/task/upload",
+        "http://[::1]:8001/task/upload",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://0.0.0.0:8001/task/upload",
+        "http://224.0.0.1:8001/task/upload",
+    ],
+)
+def test_verify_dispatch_target_rejects_loopback_and_metadata(api_url):
+    with pytest.raises(ValueError):
+        main.verify_dispatch_target(api_url)
+
+
+def test_verify_dispatch_target_allows_public_address():
+    assert main.verify_dispatch_target("http://8.8.8.8:8001/task/upload")
+
+
+def test_verify_dispatch_target_rejects_dns_resolving_to_metadata(monkeypatch):
+    """DNS 记录被指到元数据地址时必须拒绝（防 DNS 重绑定）。"""
+    monkeypatch.setattr(
+        main.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(2, 1, 6, "", ("169.254.169.254", 8001))],
+    )
+    with pytest.raises(ValueError):
+        main.verify_dispatch_target("http://worker-node-1:8001/task/upload")
+
+
+def test_verify_dispatch_target_allows_private_when_enabled(monkeypatch):
+    monkeypatch.setattr(main, "ALLOW_PRIVATE_WORKER_URLS", True)
+    monkeypatch.setattr(
+        main.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(2, 1, 6, "", ("172.18.0.5", 8001))],
+    )
+    assert main.verify_dispatch_target("http://worker-node-1:8001/task/upload")
+
+
+def test_verify_dispatch_target_rejects_private_when_disabled(monkeypatch):
+    monkeypatch.setattr(main, "ALLOW_PRIVATE_WORKER_URLS", False)
+    monkeypatch.setattr(
+        main.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(2, 1, 6, "", ("172.18.0.5", 8001))],
+    )
+    with pytest.raises(ValueError):
+        main.verify_dispatch_target("http://worker-node-1:8001/task/upload")
+
+
+def test_verify_dispatch_target_honours_allowlisted_host(monkeypatch):
+    """allowlist 必须真的起作用：关掉内网放行后，只有 allowlist 里的主机能过。"""
+    monkeypatch.setattr(main, "ALLOW_PRIVATE_WORKER_URLS", False)
+    monkeypatch.setattr(
+        main.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(2, 1, 6, "", ("172.18.0.5", 8001))],
+    )
+    monkeypatch.setattr(main, "WORKER_API_ALLOWED_HOSTS", frozenset())
+
+    with pytest.raises(ValueError):
+        main.verify_dispatch_target("http://metadata-proxy.local:8001/task/upload")
+
+    monkeypatch.setattr(main, "WORKER_API_ALLOWED_HOSTS", frozenset({"metadata-proxy.local"}))
+    assert main.verify_dispatch_target("http://metadata-proxy.local:8001/task/upload")
+
+
+def test_verify_dispatch_target_rejects_unresolvable_host(monkeypatch):
+    def _boom(*args, **kwargs):
+        raise main.socket.gaierror("no such host")
+
+    monkeypatch.setattr(main.socket, "getaddrinfo", _boom)
+    with pytest.raises(ValueError):
+        main.verify_dispatch_target("http://does-not-exist:8001/task/upload")
+
+
+def test_dispatch_url_resolution_rejects_registered_metadata_address(monkeypatch):
+    """预置在 worker_registry 里的历史地址也要在派发前复核。"""
+    monkeypatch.setattr(main, "WORKER_API_URL_MAP", {})
+    monkeypatch.setattr(main, "TRUST_SELF_REPORTED_WORKER_API_URL", True)
+    assert main.resolve_dispatch_api_url("worker-node-1", "http://169.254.169.254:80/task/upload") is None
+
+
+def test_self_reported_url_rejected_when_trust_disabled(monkeypatch):
+    monkeypatch.setattr(main, "WORKER_API_URL_MAP", {})
+    monkeypatch.setattr(main, "TRUST_SELF_REPORTED_WORKER_API_URL", False)
+    with pytest.raises(main.HTTPException):
+        main.resolve_worker_api_url("worker-node-1", "http://worker-node-1:8001/task/upload")
+
+
+def test_report_files_rejects_cross_node_identity_spoofing(mock_db):
+    """用 A 节点的密钥声明自己是 B 节点：签名校验必须按声明节点取密钥，跨节点身份不能通过。"""
+    token_a = "node-secret-token-aaa"
+    token_b = "node-secret-token-bbb"
+    payload = {
+        "worker_node": "worker-node-2",
+        "worker_api_url": "http://169.254.169.254/task/upload",
+        "protocol_version": 2,
+        "files": [],
+    }
+    raw_body, headers = _signed_report_files_request("worker-node-2", token_a, payload)
+
+    with patch.object(
+        main, "WORKER_TOKEN_MAP", {"worker-node-1": token_a, "worker-node-2": token_b}
+    ), patch("main.time.time", return_value=1700000000):
+        response = client.post("/api/report_files", content=raw_body, headers=headers)
+
+    assert response.status_code == 401
+    assert not any(
+        "worker_registry" in str(call.args[0]) and "UPDATE" in str(call.args[0]).upper()
+        for call in mock_db.execute.call_args_list
+    )
+
+
+def test_private_url_rejected_when_self_reported_but_allowed_from_map(monkeypatch):
+    """严格模式：自报的内网地址被拒绝；白名单里显式批准的同一地址可以派发。"""
+    monkeypatch.setattr(main, "ALLOW_PRIVATE_WORKER_URLS", False)
+
+    monkeypatch.setattr(main, "WORKER_API_URL_MAP", {})
+    monkeypatch.setattr(main, "TRUST_SELF_REPORTED_WORKER_API_URL", True)
+    assert main.resolve_dispatch_api_url("worker-node-1", "http://172.18.0.5:8001/task/upload") is None
+
+    monkeypatch.setattr(
+        main, "WORKER_API_URL_MAP", {"worker-node-1": "http://172.18.0.5:8001/task/upload"}
+    )
+    assert (
+        main.resolve_dispatch_api_url("worker-node-1", "")
+        == "http://172.18.0.5:8001/task/upload"
+    )
+
+
+@pytest.mark.parametrize(
+    "api_url",
+    [
+        # 阿里云元数据在 CGNAT 段里，Python 的 is_private 不认它。
+        "http://100.100.100.200/latest/meta-data/",
+        "http://100.64.0.1:8001/task/upload",
+        "http://100.127.255.254:8001/task/upload",
+        # IPv4 映射到 IPv6 的写法。
+        "http://[::ffff:100.100.100.200]/latest/meta-data/",
+        "http://192.0.0.192/latest/meta-data/",
+        "http://198.18.0.1:8001/task/upload",
+    ],
+)
+def test_verify_dispatch_target_blocks_metadata_and_special_ranges(api_url):
+    with pytest.raises(ValueError):
+        main.verify_dispatch_target(api_url)
+
+
+def test_verify_dispatch_target_blocks_dns_resolving_to_cgnat_metadata(monkeypatch):
+    monkeypatch.setattr(
+        main.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(2, 1, 6, "", ("100.100.100.200", 80))],
+    )
+    with pytest.raises(ValueError):
+        main.verify_dispatch_target("http://metadata.internal:80/latest/meta-data/")
+
+
+@pytest.mark.parametrize(
+    "api_url",
+    [
+        "http://0.1.2.3:8001/task/upload",      # Linux 会把 0/8 路由到本机
+        "http://0.0.0.1:8001/task/upload",
+        "http://[fd00:ec2::254]/latest/meta-data/",  # AWS IMDS（IPv6）
+        "http://168.63.129.16/machine?id=1",    # Azure WireServer
+    ],
+)
+def test_verify_dispatch_target_blocks_more_cloud_metadata_endpoints(api_url):
+    with pytest.raises(ValueError):
+        main.verify_dispatch_target(api_url)
+
+
+# 主流云厂商的元数据/平台端点：新增一家时只往这张表里加一行。
+CLOUD_METADATA_ENDPOINTS = [
+    ("http://169.254.169.254/latest/meta-data/", "AWS/GCP/Azure/Oracle IMDS (IPv4)"),
+    ("http://[fd00:ec2::254]/latest/meta-data/", "AWS IMDS (IPv6)"),
+    ("http://[fd20:ce::254]/computeMetadata/v1/", "GCP metadata (IPv6)"),
+    ("http://100.100.100.200/latest/meta-data/", "阿里云 metadata"),
+    ("http://192.0.0.192/latest/meta-data/", "Oracle Cloud metadata"),
+    ("http://169.254.170.2/v2/credentials/", "ECS 任务元数据"),
+    ("http://168.63.129.16/machine?id=1", "Azure WireServer"),
+]
+
+
+@pytest.mark.parametrize("api_url,label", CLOUD_METADATA_ENDPOINTS, ids=[item[1] for item in CLOUD_METADATA_ENDPOINTS])
+def test_verify_dispatch_target_blocks_every_known_metadata_endpoint(api_url, label):
+    for allow_private in (True, False):
+        with patch.object(main, "ALLOW_PRIVATE_WORKER_URLS", allow_private):
+            with pytest.raises(ValueError):
+                main.verify_dispatch_target(api_url)
+            # 白名单批准也不能把元数据地址放出来。
+            with pytest.raises(ValueError):
+                main.verify_dispatch_target(api_url, trusted_source=True)
+
+
+@pytest.mark.parametrize(
+    "api_url",
+    [
+        "http://2852039166/latest/meta-data/",          # 十进制整数形式的 169.254.169.254
+        "http://0xa9fea9fe/latest/meta-data/",          # 十六进制
+        "http://0251.0376.0251.0376/latest/meta-data/",  # 八进制
+        "http://169.254.169.254./latest/meta-data/",    # 末尾点
+    ],
+)
+def test_verify_dispatch_target_blocks_alternate_ip_literal_forms(api_url, monkeypatch):
+    """数值写法最终都会被解析成同一个地址，分类必须作用在解析结果上而不是字面量上。"""
+    from conftest import REAL_GETADDRINFO
+
+    monkeypatch.setattr(main.socket, "getaddrinfo", REAL_GETADDRINFO)
+    main._DNS_CACHE.clear()
+    with pytest.raises(ValueError):
+        main.verify_dispatch_target(api_url)
+
+
+def test_dns_resolution_timeout_is_fail_closed(monkeypatch):
+    """自报主机名指向黑洞 DNS 时不能再无限阻塞调度线程。"""
+    import threading as _threading
+
+    release = _threading.Event()
+
+    def _hang(*args, **kwargs):
+        release.wait(10)
+        return []
+
+    monkeypatch.setattr(main.socket, "getaddrinfo", _hang)
+    monkeypatch.setattr(main, "_DNS_RESOLVE_TIMEOUT_SECONDS", 0.2)
+    main._DNS_CACHE.clear()
+    started = time.monotonic()
+    try:
+        with pytest.raises(ValueError):
+            main.verify_dispatch_target("http://blackhole.invalid:8001/task/upload")
+        elapsed = time.monotonic() - started
+        # 断言耗时而不只是"抛了异常"：桩会挂 10 秒，没有超时保护时照样会抛 ValueError。
+        assert elapsed < 3.0, f"解析没有被超时打断（耗时 {elapsed:.1f}s）"
+    finally:
+        release.set()
+        main._DNS_CACHE.clear()
+
+
+def test_allowlist_does_not_bypass_metadata_addresses(monkeypatch):
+    """allowlist 只放开内网判定，元数据/回环仍然拒绝。"""
+    monkeypatch.setattr(main, "WORKER_API_ALLOWED_HOSTS", frozenset({"proxy.local"}))
+    monkeypatch.setattr(
+        main.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(2, 1, 6, "", ("169.254.169.254", 80))],
+    )
+    main._DNS_CACHE.clear()
+    with pytest.raises(ValueError):
+        main.verify_dispatch_target("http://proxy.local/latest/meta-data/")
