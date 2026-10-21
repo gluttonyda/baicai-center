@@ -1,0 +1,2 @@
+# 仅开发与测试使用，生产镜像不安装。安装：pip install -r requirements.txt -r requirements-dev.txt
+pytest==8.3.5

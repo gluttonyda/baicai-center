@@ -21,7 +21,8 @@ Center 是 Baicai 的主控大脑，负责 API、数据库状态、账号锁和�
 - `init_sync.py`：目标盘历史文件同步脚本
 - `Dockerfile`：Center 镜像构建
 - `docker-compose.yml`：Center 容器启动配置
-- `requirements.txt`：Center Python 依赖
+- `requirements.txt`：Center 运行时 Python 依赖（镜像只安装这一份）
+- `requirements-dev.txt`：开发与测试依赖（pytest），不进入生产镜像
 - `SCHEMA_MINIMAL.sql`：最小可运行数据库结构
 - `MIGRATION_SPLIT_ACCOUNT_LOCKS.sql`：账号锁字段迁移脚本
 - `MIGRATION_UPLOAD_USAGE_STATS.sql`：旧库上传统计迁移
@@ -29,7 +30,7 @@ Center 是 Baicai 的主控大脑，负责 API、数据库状态、账号锁和�
 - `MIGRATION_FILE_PATH_HASH.sql`：补齐 `file_tasks.file_path_hash` 生成列及唯一索引
 - `scripts/check_db.py`：数据库连接检查
 - `scripts/query_db.py`：任务状态查询示例
-- `scripts/reset_db.py`：数据库重置辅助脚本
+- `scripts/reset_db.py`：数据库重置辅助脚本；必须传 `--yes` 或在交互终端输入数据库名确认，`--dry-run` 只读预览
 
 ## API
 

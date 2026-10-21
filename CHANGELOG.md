@@ -2,6 +2,26 @@
 
 本文件记录代码行为和升级要求，不代表已对运行节点执行部署。日期使用 UTC；2026-09-14 一节的整理时间对应北京时间 2026-09-15。
 
+## 2026-10-21（依赖拆分与运行时加固）
+
+### 调整
+
+- `scripts/reset_db.py` 删除前必须确认：传 `--yes`，或在交互终端输入数据库名。非交互环境且未传 `--yes` 时拒绝并返回 1；确认在连接数据库之前完成，拒绝时不建立连接。
+- `scripts/reset_db.py` 新增 `--dry-run`：只打印将删除的表与行数、将释放执行租约的账号数，不删除、不提交。
+- `requirements.txt` 只保留运行时依赖，`pytest` 移到新增的 `requirements-dev.txt`；Center 生产镜像不再包含 pytest。
+- `cryptography` 从 41.0.5 升到 50.0.2（PyMySQL 的 `caching_sha2_password` 认证需要它；50.0.2 之前的 wheel 仍带 OpenSSL 等公开公告）。fastapi、pydantic、starlette 未升级，后续单独评估。
+- `baicai-work/requirements.txt` 去掉 Worker/Scanner 实际未使用的 pymysql、cryptography、apscheduler、dbutils 与 pytest。
+- Center 容器改为以非 root 用户 `baicai`（uid/gid 10001）运行，并设置 `PYTHONDONTWRITEBYTECODE=1`、`PYTHONUNBUFFERED=1`。Worker 镜像仍以 root 运行。
+- `PATH` 中没有 `rclone` 时，`tests/test_worker_integration.py` 的 2 个真实 rclone 用例显示为 skipped，不再失败。
+
+### 升级与验证
+
+- 在非交互环境中调用 `scripts/reset_db.py` 的自动化需要加 `--yes`。
+- 开发机改用 `pip install -r requirements.txt -r requirements-dev.txt` 安装依赖。
+- Center 没有宿主机挂载，切换用户不需要调整宿主机权限；`docker exec` 默认以 `baicai` 身份执行。本轮没有构建生产镜像。
+- 在隔离测试容器中（无 MySQL、有 rclone）执行全量测试：**219 passed**，26 skipped，4 条 FastAPI `on_event` 弃用警告。带真实 MySQL 的全量运行和不挂载 rclone 的运行尚未执行。
+- 兼容影响、Worker 仍以 root 运行的原因和后续步骤见 [2026-10-21 依赖拆分与运行时加固说明](docs/CODE_CHANGES_20261021_runtime.md)。
+
 ## 2026-10-21
 
 ### 修复
