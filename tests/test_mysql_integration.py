@@ -714,3 +714,94 @@ def test_mark_successful_uploads_matches_normalized_paths(schema_db):
     # 未列入回报路径的任务必须保持 uploading
     assert statuses["movie/untouched.mkv"] == "uploading"
     assert events == len(reported)
+
+
+def test_mark_successful_uploads_picks_single_row_per_reported_path(schema_db):
+    """一条回报只能命中一行：`a.mkv` 与 `/a.mkv` 可共存（唯一键是原始路径哈希）。"""
+    with schema_db.cursor() as cursor:
+        cursor.execute(
+            "INSERT INTO worker_registry (node_name, api_url, protocol_version, last_active) "
+            "VALUES ('worker-node-1', 'http://worker-node-1:8001/task/upload', 2, UTC_TIMESTAMP())"
+        )
+        cursor.execute(
+            "INSERT INTO drive_accounts (account_name, role, is_active) VALUES ('baicai_1@1', 'uploader', 1)"
+        )
+        for path in ("movie/x.mkv", "/movie/x.mkv"):
+            cursor.execute(
+                "INSERT INTO file_tasks (file_path, status, worker_node, account_used, size_bytes, dispatch_id) "
+                "VALUES (%s, 'uploading', 'worker-node-1', 'baicai_1@1', 10, NULL)",
+                (path,),
+            )
+
+    with schema_db.cursor() as cursor:
+        main.mark_successful_uploads_by_files(cursor, "baicai_1@1", "staged", ["movie/x.mkv"], None)
+
+    with schema_db.cursor() as cursor:
+        cursor.execute("SELECT file_path, status FROM file_tasks ORDER BY file_path")
+        statuses = {row["file_path"]: row["status"] for row in cursor.fetchall()}
+        cursor.execute("SELECT COUNT(*) AS events FROM account_upload_events")
+        events = cursor.fetchone()["events"]
+
+    # 精确同名的那行成功；带前导 / 的另一行从未被确认上传，必须保持 uploading。
+    assert statuses["movie/x.mkv"] == "staged"
+    assert statuses["/movie/x.mkv"] == "uploading"
+    assert events == 1
+
+
+def test_mark_successful_uploads_prefers_exact_slash_variant(schema_db):
+    """回报带前导 / 时，应命中带 / 的那一行，而不是归一化相同的另一行。"""
+    with schema_db.cursor() as cursor:
+        cursor.execute(
+            "INSERT INTO worker_registry (node_name, api_url, protocol_version, last_active) "
+            "VALUES ('worker-node-1', 'http://worker-node-1:8001/task/upload', 2, UTC_TIMESTAMP())"
+        )
+        cursor.execute(
+            "INSERT INTO drive_accounts (account_name, role, is_active) VALUES ('baicai_1@1', 'uploader', 1)"
+        )
+        for path in ("movie/y.mkv", "/movie/y.mkv"):
+            cursor.execute(
+                "INSERT INTO file_tasks (file_path, status, worker_node, account_used, size_bytes, dispatch_id) "
+                "VALUES (%s, 'uploading', 'worker-node-1', 'baicai_1@1', 10, NULL)",
+                (path,),
+            )
+
+    with schema_db.cursor() as cursor:
+        main.mark_successful_uploads_by_files(cursor, "baicai_1@1", "staged", ["/movie/y.mkv"], None)
+
+    with schema_db.cursor() as cursor:
+        cursor.execute("SELECT file_path, status FROM file_tasks ORDER BY file_path")
+        statuses = {row["file_path"]: row["status"] for row in cursor.fetchall()}
+
+    assert statuses["/movie/y.mkv"] == "staged"
+    assert statuses["movie/y.mkv"] == "uploading"
+
+
+def test_mark_successful_uploads_preserves_leading_whitespace(schema_db):
+    """首尾空白是文件名的一部分（Issue #2）：归一化不能 strip，否则这类路径永远匹配不上。"""
+    stored_path = " leading/movie.mkv"
+    with schema_db.cursor() as cursor:
+        cursor.execute(
+            "INSERT INTO worker_registry (node_name, api_url, protocol_version, last_active) "
+            "VALUES ('worker-node-1', 'http://worker-node-1:8001/task/upload', 2, UTC_TIMESTAMP())"
+        )
+        cursor.execute(
+            "INSERT INTO drive_accounts (account_name, role, is_active) VALUES ('baicai_1@1', 'uploader', 1)"
+        )
+        cursor.execute(
+            "INSERT INTO file_tasks (file_path, status, worker_node, account_used, size_bytes, dispatch_id) "
+            "VALUES (%s, 'uploading', 'worker-node-1', 'baicai_1@1', 10, NULL)",
+            (stored_path,),
+        )
+
+    with schema_db.cursor() as cursor:
+        main.mark_successful_uploads_by_files(cursor, "baicai_1@1", "staged", [stored_path], None)
+
+    with schema_db.cursor() as cursor:
+        cursor.execute("SELECT status FROM file_tasks WHERE file_path=%s", (stored_path,))
+        status = cursor.fetchone()["status"]
+
+    assert status == "staged"
+
+
+def test_normalize_relative_path_keeps_whitespace():
+    assert main.normalize_relative_path(" leading/a.mkv ") == " leading/a.mkv "

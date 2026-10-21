@@ -834,8 +834,11 @@ def update_cleaner_tasks_by_files(
 
 
 def normalize_relative_path(path: str) -> str:
-    """把上报路径归一成与 file_tasks 存储值可比较的形式（去前导 ./ 与 /）。"""
-    normalized = path.replace("\\", "/").strip()
+    """把上报路径归一成与 file_tasks 存储值可比较的形式（去前导 ./ 与 /）。
+
+    刻意不 strip()：首尾空白是文件名的一部分（见 Issue #2），SQL 侧同样不裁剪空白。
+    """
+    normalized = path.replace("\\", "/")
     while normalized.startswith("./"):
         normalized = normalized[2:]
     return normalized.lstrip("/")
@@ -847,31 +850,81 @@ def _normalized_path_expression(column: str) -> str:
     return f"TRIM(LEADING '/' FROM REGEXP_REPLACE({column}, '^([.]/)+', ''))"
 
 
+def resolve_successful_task_ids(
+    cursor,
+    account_name: str,
+    file_paths: List[str],
+    dispatch_id: Optional[str] = None,
+) -> List[int]:
+    """把回报路径映射成唯一的 file_task id：先精确匹配，未命中再用归一化值兜底。
+
+    不能只靠 UPDATE ... WHERE 归一化值 IN (...) ：file_tasks 的唯一键是原始路径的哈希，
+    `a.mkv` 与 `/a.mkv` 可以共存，一条回报会同时命中两行，把从未上传的那行也标成功。
+    """
+    if not file_paths:
+        return []
+    normalized_paths = list(dict.fromkeys(normalize_relative_path(path) for path in file_paths))
+    exact_placeholders = ",".join(["%s"] * len(file_paths))
+    normalized_placeholders = ",".join(["%s"] * len(normalized_paths))
+    task_condition, task_params = _task_dispatch_condition(dispatch_id)
+    cursor.execute(
+        f"""
+        SELECT id, file_path FROM file_tasks
+        WHERE account_used=%s
+          AND status='uploading'
+          AND {task_condition}
+          AND (file_path IN ({exact_placeholders})
+               OR {_normalized_path_expression("file_path")} IN ({normalized_placeholders}))
+        """,
+        [account_name] + task_params + list(file_paths) + normalized_paths,
+    )
+    rows = cursor.fetchall() or []
+    candidates: dict[str, list[dict]] = {}
+    for row in rows:
+        candidates.setdefault(normalize_relative_path(row["file_path"]), []).append(row)
+
+    chosen_ids: List[int] = []
+    for reported_path in file_paths:
+        bucket = candidates.get(normalize_relative_path(reported_path))
+        if not bucket:
+            continue
+        # 精确同名优先，避免把 `/a.mkv` 那行当成 `a.mkv` 的成功。
+        match = next((row for row in bucket if row["file_path"] == reported_path), bucket[0])
+        bucket.remove(match)
+        chosen_ids.append(int(match["id"]))
+    return list(dict.fromkeys(chosen_ids))
+
+
 def insert_upload_usage_events_for_files(
     cursor,
     account_name: str,
     file_paths: List[str],
     dispatch_id: Optional[str] = None,
 ):
-    if not file_paths:
+    task_ids = resolve_successful_task_ids(cursor, account_name, file_paths, dispatch_id)
+    record_upload_usage_events_for_task_ids(cursor, account_name, task_ids, dispatch_id)
+
+
+def record_upload_usage_events_for_task_ids(
+    cursor,
+    account_name: str,
+    task_ids: List[int],
+    dispatch_id: Optional[str] = None,
+):
+    if not task_ids:
         return
-    for start in range(0, len(file_paths), MAX_SUCCESSFUL_FILES):
-        chunk = file_paths[start:start + MAX_SUCCESSFUL_FILES]
-        normalized_chunk = [normalize_relative_path(path) for path in chunk]
-        format_strings = ",".join(["%s"] * len(normalized_chunk))
-        task_condition, task_params = _task_dispatch_condition(dispatch_id)
+    for start in range(0, len(task_ids), MAX_SUCCESSFUL_FILES):
+        chunk = task_ids[start:start + MAX_SUCCESSFUL_FILES]
+        format_strings = ",".join(["%s"] * len(chunk))
         cursor.execute(
             f"""
             INSERT IGNORE INTO account_upload_events
                 (account_name, file_task_id, dispatch_id, size_bytes, uploaded_at)
             SELECT %s, id, %s, COALESCE(size_bytes, 0), UTC_TIMESTAMP()
             FROM file_tasks
-            WHERE account_used=%s
-              AND status='uploading'
-              AND {task_condition}
-              AND {_normalized_path_expression("file_path")} IN ({format_strings})
+            WHERE id IN ({format_strings})
             """,
-            [account_name, dispatch_id or "legacy", account_name] + task_params + normalized_chunk,
+            [account_name, dispatch_id or "legacy"] + chunk,
         )
 
 
@@ -900,24 +953,20 @@ def mark_successful_uploads_by_files(
 ):
     if not file_paths:
         return
-    insert_upload_usage_events_for_files(cursor, account_name, file_paths, dispatch_id)
-    for start in range(0, len(file_paths), MAX_SUCCESSFUL_FILES):
-        chunk = file_paths[start:start + MAX_SUCCESSFUL_FILES]
-        normalized_chunk = [normalize_relative_path(path) for path in chunk]
-        format_strings = ",".join(["%s"] * len(normalized_chunk))
-        task_condition, task_params = _task_dispatch_condition(dispatch_id)
+    task_ids = resolve_successful_task_ids(cursor, account_name, file_paths, dispatch_id)
+    record_upload_usage_events_for_task_ids(cursor, account_name, task_ids, dispatch_id)
+    for start in range(0, len(task_ids), MAX_SUCCESSFUL_FILES):
+        chunk = task_ids[start:start + MAX_SUCCESSFUL_FILES]
+        format_strings = ",".join(["%s"] * len(chunk))
         cursor.execute(
             f"""
             UPDATE file_tasks
             SET status=%s,
                 dispatch_id=NULL,
                 updated_at=UTC_TIMESTAMP()
-            WHERE account_used=%s
-              AND status='uploading'
-              AND {task_condition}
-              AND {_normalized_path_expression("file_path")} IN ({format_strings})
+            WHERE id IN ({format_strings})
             """,
-            [target_status, account_name] + task_params + normalized_chunk,
+            [target_status] + chunk,
         )
 
 
