@@ -656,3 +656,61 @@ def test_dispatch_db_lock_is_held_during_run_and_released_after_exception(schema
     # 异常后仍可执行完整的真实调度 SQL（空库无节点时只做巡检）。
     assert main.dispatch_uploader_tasks() is True
     assert scalar(schema_db, "SELECT IS_FREE_LOCK(%s)", (lock_name,)) == 1
+
+
+def test_mark_successful_uploads_matches_normalized_paths(schema_db):
+    """库里存原始路径（带前导 / 或 ./），Worker 回报归一化路径时仍要精确命中。
+
+    用例特意包含以任意单字符开头的目录（a/、1/、x/），用于捕获 SQL 正则退化
+    （历史上曾用反斜杠转义点号写法，MySQL 字面量会吃掉反斜杠，
+    导致 "a/movie.mkv" 被误删成 "movie.mkv"）。
+    """
+    stored = [
+        "/movie/slash.mkv",
+        "./movie/dot.mkv",
+        "movie/plain.mkv",
+        "a/movie.mkv",
+        "1/episode.mkv",
+        "x/holiday.mp4",
+        "holiday.mp4",
+        "movie/untouched.mkv",
+    ]
+    reported = [
+        "movie/slash.mkv",
+        "movie/dot.mkv",
+        "movie/plain.mkv",
+        "a/movie.mkv",
+        "1/episode.mkv",
+        "x/holiday.mp4",
+        "holiday.mp4",
+    ]
+
+    with schema_db.cursor() as cursor:
+        cursor.execute(
+            "INSERT INTO worker_registry (node_name, api_url, protocol_version, last_active) "
+            "VALUES ('worker-node-1', 'http://worker-node-1:8001/task/upload', 2, UTC_TIMESTAMP())"
+        )
+        cursor.execute(
+            "INSERT INTO drive_accounts (account_name, role, is_active) VALUES ('baicai_1@1', 'uploader', 1)"
+        )
+        for path in stored:
+            cursor.execute(
+                "INSERT INTO file_tasks (file_path, status, worker_node, account_used, size_bytes, dispatch_id) "
+                "VALUES (%s, 'uploading', 'worker-node-1', 'baicai_1@1', 10, NULL)",
+                (path,),
+            )
+
+    with schema_db.cursor() as cursor:
+        main.mark_successful_uploads_by_files(cursor, "baicai_1@1", "staged", reported, None)
+
+    with schema_db.cursor() as cursor:
+        cursor.execute("SELECT file_path, status FROM file_tasks ORDER BY file_path")
+        statuses = {row["file_path"]: row["status"] for row in cursor.fetchall()}
+        cursor.execute("SELECT COUNT(*) AS events FROM account_upload_events")
+        events = cursor.fetchone()["events"]
+
+    for path in stored[:-1]:
+        assert statuses[path] == "staged", path
+    # 未列入回报路径的任务必须保持 uploading
+    assert statuses["movie/untouched.mkv"] == "uploading"
+    assert events == len(reported)

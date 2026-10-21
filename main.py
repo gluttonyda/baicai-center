@@ -833,6 +833,20 @@ def update_cleaner_tasks_by_files(
         )
 
 
+def normalize_relative_path(path: str) -> str:
+    """把上报路径归一成与 file_tasks 存储值可比较的形式（去前导 ./ 与 /）。"""
+    normalized = path.replace("\\", "/").strip()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized.lstrip("/")
+
+
+def _normalized_path_expression(column: str) -> str:
+    """SQL 侧同样的归一化：先去掉开头的 ./ 序列，再裁掉前导 /。"""
+    # 用 [.] 代替 \. ：MySQL 字符串字面量会吃掉单层反斜杠，导致模式退化。
+    return f"TRIM(LEADING '/' FROM REGEXP_REPLACE({column}, '^([.]/)+', ''))"
+
+
 def insert_upload_usage_events_for_files(
     cursor,
     account_name: str,
@@ -843,7 +857,8 @@ def insert_upload_usage_events_for_files(
         return
     for start in range(0, len(file_paths), MAX_SUCCESSFUL_FILES):
         chunk = file_paths[start:start + MAX_SUCCESSFUL_FILES]
-        format_strings = ",".join(["%s"] * len(chunk))
+        normalized_chunk = [normalize_relative_path(path) for path in chunk]
+        format_strings = ",".join(["%s"] * len(normalized_chunk))
         task_condition, task_params = _task_dispatch_condition(dispatch_id)
         cursor.execute(
             f"""
@@ -854,9 +869,9 @@ def insert_upload_usage_events_for_files(
             WHERE account_used=%s
               AND status='uploading'
               AND {task_condition}
-              AND file_path IN ({format_strings})
+              AND {_normalized_path_expression("file_path")} IN ({format_strings})
             """,
-            [account_name, dispatch_id or "legacy", account_name] + task_params + chunk,
+            [account_name, dispatch_id or "legacy", account_name] + task_params + normalized_chunk,
         )
 
 
@@ -888,7 +903,8 @@ def mark_successful_uploads_by_files(
     insert_upload_usage_events_for_files(cursor, account_name, file_paths, dispatch_id)
     for start in range(0, len(file_paths), MAX_SUCCESSFUL_FILES):
         chunk = file_paths[start:start + MAX_SUCCESSFUL_FILES]
-        format_strings = ",".join(["%s"] * len(chunk))
+        normalized_chunk = [normalize_relative_path(path) for path in chunk]
+        format_strings = ",".join(["%s"] * len(normalized_chunk))
         task_condition, task_params = _task_dispatch_condition(dispatch_id)
         cursor.execute(
             f"""
@@ -899,10 +915,33 @@ def mark_successful_uploads_by_files(
             WHERE account_used=%s
               AND status='uploading'
               AND {task_condition}
-              AND file_path IN ({format_strings})
+              AND {_normalized_path_expression("file_path")} IN ({format_strings})
             """,
-            [target_status, account_name] + task_params + chunk,
+            [target_status, account_name] + task_params + normalized_chunk,
         )
+
+
+def count_uploading_tasks(cursor, account_name: str, dispatch_id: Optional[str]) -> int:
+    task_condition, task_params = _task_dispatch_condition(dispatch_id)
+    cursor.execute(
+        f"SELECT COUNT(*) AS uploading_count FROM file_tasks "
+        f"WHERE account_used=%s AND status='uploading' AND {task_condition}",
+        [account_name] + task_params,
+    )
+    row = cursor.fetchone() or {}
+    return int(row.get("uploading_count") or 0)
+
+
+def get_worker_protocol_version(cursor, node_name: Optional[str]) -> int:
+    """取节点的协议版本；未知节点按 v1 处理（保持旧的整批语义）。"""
+    if not node_name:
+        return 1
+    cursor.execute("SELECT protocol_version FROM worker_registry WHERE node_name=%s", (node_name,))
+    row = cursor.fetchone() or {}
+    try:
+        return int(row.get("protocol_version") or 1)
+    except (TypeError, ValueError):
+        return 1
 
 
 def mark_all_uploading_tasks_success(
@@ -2363,7 +2402,26 @@ def receive_worker_report(req: ReportStatusRequest, node_auth: dict[str, Optiona
                 )
                 trigger_dispatch_now = True
             elif req.status == "completed":
-                mark_all_uploading_tasks_success(cursor, req.account_name, success_target_status, req.dispatch_id)
+                protocol_version = get_worker_protocol_version(cursor, req.worker_node)
+                if protocol_version >= 2:
+                    # 协议 v2 的 Worker 会逐文件回报；上面已按 successful_files 精确标记，
+                    # 这里不能再整批置成功，否则漏搬/跳过的任务会被静默算作完成。
+                    skipped = count_uploading_tasks(cursor, req.account_name, req.dispatch_id)
+                    if skipped:
+                        logger.warning(
+                            "⚠️ 账号 [%s] dispatch [%s] 有 %s 个任务未出现在成功清单中，保持 uploading 等租约回收后重派。",
+                            req.account_name,
+                            req.dispatch_id,
+                            skipped,
+                        )
+                else:
+                    logger.warning(
+                        "⚠️ 节点 [%s] 协议版本 <2，回执不含逐文件明细，按整批置成功（兼容路径），无法识别部分失败。",
+                        req.worker_node,
+                    )
+                    mark_all_uploading_tasks_success(
+                        cursor, req.account_name, success_target_status, req.dispatch_id
+                    )
                 release_account_lock(cursor, req.account_name, req.dispatch_id, req.worker_node)
             elif req.status == "clean_success":
                 if account_role != "cleaner":
