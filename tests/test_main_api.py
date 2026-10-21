@@ -2390,3 +2390,26 @@ def test_verify_dispatch_target_blocks_dns_resolving_to_cgnat_metadata(monkeypat
 def test_verify_dispatch_target_blocks_more_cloud_metadata_endpoints(api_url):
     with pytest.raises(ValueError):
         main.verify_dispatch_target(api_url)
+
+
+# 主流云厂商的元数据/平台端点：新增一家时只往这张表里加一行。
+CLOUD_METADATA_ENDPOINTS = [
+    ("http://169.254.169.254/latest/meta-data/", "AWS/GCP/Azure/Oracle IMDS (IPv4)"),
+    ("http://[fd00:ec2::254]/latest/meta-data/", "AWS IMDS (IPv6)"),
+    ("http://[fd20:ce::254]/computeMetadata/v1/", "GCP metadata (IPv6)"),
+    ("http://100.100.100.200/latest/meta-data/", "阿里云 metadata"),
+    ("http://192.0.0.192/latest/meta-data/", "Oracle Cloud metadata"),
+    ("http://169.254.170.2/v2/credentials/", "ECS 任务元数据"),
+    ("http://168.63.129.16/machine?id=1", "Azure WireServer"),
+]
+
+
+@pytest.mark.parametrize("api_url,label", CLOUD_METADATA_ENDPOINTS, ids=[item[1] for item in CLOUD_METADATA_ENDPOINTS])
+def test_verify_dispatch_target_blocks_every_known_metadata_endpoint(api_url, label):
+    for allow_private in (True, False):
+        with patch.object(main, "ALLOW_PRIVATE_WORKER_URLS", allow_private):
+            with pytest.raises(ValueError):
+                main.verify_dispatch_target(api_url)
+            # 白名单批准也不能把元数据地址放出来。
+            with pytest.raises(ValueError):
+                main.verify_dispatch_target(api_url, trusted_source=True)
