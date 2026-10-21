@@ -176,10 +176,44 @@ if not TRUST_SELF_REPORTED_WORKER_API_URL and not WORKER_API_URL_MAP:
     )
 if ALLOW_PRIVATE_WORKER_URLS:
     logger.info("🔓 ALLOW_PRIVATE_WORKER_URLS=true：允许派发到内网地址（容器网络部署需要）。")
+if ALLOW_PRIVATE_WORKER_URLS and TRUST_SELF_REPORTED_WORKER_API_URL and not WORKER_API_URL_MAP:
+    logger.warning(
+        "⚠️ 当前同时允许内网地址、信任节点自报地址、且没有白名单：持有节点令牌的一方可以让 Center "
+        "向任意内网地址 POST 任务。收紧方式：配置 WORKER_API_URL_MAP（白名单地址即使 ALLOW_PRIVATE_WORKER_URLS=false 也可派发）。"
+    )
 
 
-def _blocked_address_reason(ip: "ipaddress.IPv4Address | ipaddress.IPv6Address") -> Optional[str]:
+# 这些网段无论开关怎么设都拒绝。Python 的 is_private/is_reserved 不覆盖它们，
+# 但其中就有云厂商的元数据地址：阿里云 100.100.100.200 落在 CGNAT 100.64.0.0/10，
+# Oracle/IBM 等用 192.0.0.0/24 里的地址，命中即等于把节点凭据/任务信息送到元数据服务。
+_ALWAYS_BLOCKED_NETWORKS = tuple(
+    ipaddress.ip_network(network)
+    for network in (
+        "100.64.0.0/10",   # CGNAT / 共享地址空间（含阿里云元数据 100.100.100.200）
+        "192.0.0.0/24",    # IETF 协议分配（含部分云厂商元数据）
+        "198.18.0.0/15",   # 基准测试保留段
+        "240.0.0.0/4",     # 保留
+        "255.255.255.255/32",
+        "100::/64",        # IPv6 丢弃段
+        "2001:db8::/32",   # 文档用段
+    )
+)
+
+
+def _blocked_address_reason(
+    ip: "ipaddress.IPv4Address | ipaddress.IPv6Address",
+    allow_private: bool = False,
+) -> Optional[str]:
     """按地址类型给出拒绝原因；返回 None 表示允许。"""
+    # ::ffff:100.100.100.200 这类 IPv4 映射地址要先还原成 IPv4 再分类，
+    # 否则 Python ≥3.13 会把它当成普通 IPv6 地址（不同版本行为还不一致）。
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+
+    for network in _ALWAYS_BLOCKED_NETWORKS:
+        if ip.version == network.version and ip in network:
+            return f"禁用网段 {network}"
+
     if ip.is_loopback:
         return "回环地址"
     if ip.is_link_local:
@@ -190,12 +224,12 @@ def _blocked_address_reason(ip: "ipaddress.IPv4Address | ipaddress.IPv6Address")
         return "未指定地址（0.0.0.0/::）"
     if getattr(ip, "is_reserved", False):
         return "保留地址"
-    if ip.is_private and not ALLOW_PRIVATE_WORKER_URLS:
-        return "内网地址（ALLOW_PRIVATE_WORKER_URLS=false）"
+    if ip.is_private and not (ALLOW_PRIVATE_WORKER_URLS or allow_private):
+        return "内网地址（ALLOW_PRIVATE_WORKER_URLS=false 且该地址不在 WORKER_API_URL_MAP 里）"
     return None
 
 
-def _verify_resolved_addresses(host: str, port: int) -> None:
+def _verify_resolved_addresses(host: str, port: int, allow_private: bool = False) -> None:
     if host.lower() in WORKER_API_ALLOWED_HOSTS:
         return
     try:
@@ -203,7 +237,7 @@ def _verify_resolved_addresses(host: str, port: int) -> None:
     except ValueError:
         literal = None
     if literal is not None:
-        reason = _blocked_address_reason(literal)
+        reason = _blocked_address_reason(literal, allow_private=allow_private)
         if reason:
             raise ValueError(f"worker_api_url 指向被拒绝的地址（{reason}）")
         return
@@ -220,12 +254,12 @@ def _verify_resolved_addresses(host: str, port: int) -> None:
             ip = ipaddress.ip_address(address)
         except ValueError:
             raise ValueError("worker_api_url 解析出无法识别的地址")
-        reason = _blocked_address_reason(ip)
+        reason = _blocked_address_reason(ip, allow_private=allow_private)
         if reason:
             raise ValueError(f"worker_api_url 解析到被拒绝的地址（{reason}）")
 
 
-def verify_dispatch_target(api_url: str) -> str:
+def verify_dispatch_target(api_url: str, trusted_source: bool = False) -> str:
     """派发前复核出站目标的实际地址。
 
     worker_api_url 会来自节点自报或历史注册记录，格式合法不等于可以连：这里在每次派发前
@@ -237,7 +271,7 @@ def verify_dispatch_target(api_url: str) -> str:
     if not host:
         raise ValueError("worker_api_url 缺少主机名")
     port = parts.port or (443 if parts.scheme == "https" else 80)
-    _verify_resolved_addresses(host, port)
+    _verify_resolved_addresses(host, port, allow_private=trusted_source)
     return api_url
 
 
@@ -501,7 +535,10 @@ def resolve_worker_api_url(worker_node: str, reported_api_url: str) -> str:
 def resolve_dispatch_api_url(worker_node: str, registered_api_url: str) -> Optional[str]:
     """派发前按当前白名单重新解析 worker_registry 中的地址并复核实际地址；不可派发时记 warning 并返回 None。"""
     try:
-        return verify_dispatch_target(resolve_worker_api_url(worker_node, registered_api_url))
+        trusted = worker_node in WORKER_API_URL_MAP
+        return verify_dispatch_target(
+            resolve_worker_api_url(worker_node, registered_api_url), trusted_source=trusted
+        )
     except HTTPException:
         logger.warning("⏭️ 节点 [%s] 未在 WORKER_API_URL_MAP 白名单中，跳过本次派发。", worker_node)
     except ValueError as exc:

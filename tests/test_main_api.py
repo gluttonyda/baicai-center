@@ -2333,11 +2333,46 @@ def test_report_files_rejects_cross_node_identity_spoofing(mock_db):
     )
 
 
-def test_non_allowlisted_private_url_rejected_at_dispatch(monkeypatch):
-    """内网开关关闭时，映射里的内网地址也不能派发；打开后可以。"""
-    monkeypatch.setattr(main, "WORKER_API_URL_MAP", {"worker-node-1": "http://172.18.0.5:8001/task/upload"})
+def test_private_url_rejected_when_self_reported_but_allowed_from_map(monkeypatch):
+    """严格模式：自报的内网地址被拒绝；白名单里显式批准的同一地址可以派发。"""
     monkeypatch.setattr(main, "ALLOW_PRIVATE_WORKER_URLS", False)
-    assert main.resolve_dispatch_api_url("worker-node-1", "") is None
 
-    monkeypatch.setattr(main, "ALLOW_PRIVATE_WORKER_URLS", True)
-    assert main.resolve_dispatch_api_url("worker-node-1", "") == "http://172.18.0.5:8001/task/upload"
+    monkeypatch.setattr(main, "WORKER_API_URL_MAP", {})
+    monkeypatch.setattr(main, "TRUST_SELF_REPORTED_WORKER_API_URL", True)
+    assert main.resolve_dispatch_api_url("worker-node-1", "http://172.18.0.5:8001/task/upload") is None
+
+    monkeypatch.setattr(
+        main, "WORKER_API_URL_MAP", {"worker-node-1": "http://172.18.0.5:8001/task/upload"}
+    )
+    assert (
+        main.resolve_dispatch_api_url("worker-node-1", "")
+        == "http://172.18.0.5:8001/task/upload"
+    )
+
+
+@pytest.mark.parametrize(
+    "api_url",
+    [
+        # 阿里云元数据在 CGNAT 段里，Python 的 is_private 不认它。
+        "http://100.100.100.200/latest/meta-data/",
+        "http://100.64.0.1:8001/task/upload",
+        "http://100.127.255.254:8001/task/upload",
+        # IPv4 映射到 IPv6 的写法。
+        "http://[::ffff:100.100.100.200]/latest/meta-data/",
+        "http://192.0.0.192/latest/meta-data/",
+        "http://198.18.0.1:8001/task/upload",
+    ],
+)
+def test_verify_dispatch_target_blocks_metadata_and_special_ranges(api_url):
+    with pytest.raises(ValueError):
+        main.verify_dispatch_target(api_url)
+
+
+def test_verify_dispatch_target_blocks_dns_resolving_to_cgnat_metadata(monkeypatch):
+    monkeypatch.setattr(
+        main.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(2, 1, 6, "", ("100.100.100.200", 80))],
+    )
+    with pytest.raises(ValueError):
+        main.verify_dispatch_target("http://metadata.internal:80/latest/meta-data/")
