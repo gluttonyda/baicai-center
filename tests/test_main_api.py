@@ -2282,6 +2282,18 @@ def test_verify_dispatch_target_rejects_private_when_disabled(monkeypatch):
 
 
 def test_verify_dispatch_target_honours_allowlisted_host(monkeypatch):
+    """allowlist 必须真的起作用：关掉内网放行后，只有 allowlist 里的主机能过。"""
+    monkeypatch.setattr(main, "ALLOW_PRIVATE_WORKER_URLS", False)
+    monkeypatch.setattr(
+        main.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(2, 1, 6, "", ("172.18.0.5", 8001))],
+    )
+    monkeypatch.setattr(main, "WORKER_API_ALLOWED_HOSTS", frozenset())
+
+    with pytest.raises(ValueError):
+        main.verify_dispatch_target("http://metadata-proxy.local:8001/task/upload")
+
     monkeypatch.setattr(main, "WORKER_API_ALLOWED_HOSTS", frozenset({"metadata-proxy.local"}))
     assert main.verify_dispatch_target("http://metadata-proxy.local:8001/task/upload")
 

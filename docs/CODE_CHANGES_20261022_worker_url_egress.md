@@ -50,7 +50,8 @@
 ## 测试
 
 - 全量：**391 passed, 0 skipped, 4 warnings**（真 MySQL 8.4.8 + 真实 rclone v1.65.0）。
-- `tests/conftest.py` 新增 autouse fixture 为派发主机名提供稳定的测试解析结果（专测地址分类的用例自行覆盖），并对测试用 MySQL 容器名透传真实解析。
+- `tests/conftest.py` 新增 autouse fixture 为派发主机名提供稳定的测试解析结果（用真正的公网地址 `93.184.216.34`，否则"内网默认放行"会把 allowlist 之类的断言变成空测），并对测试用 MySQL 容器名透传真实解析。
+- 变异验证：删掉 `_verify_resolved_addresses` 里的 allowlist 短路后，`test_verify_dispatch_target_honours_allowlisted_host` 会失败（确认该用例不是空测）。
 
 ## 已知云元数据端点（测试逐条覆盖）
 

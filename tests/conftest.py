@@ -46,7 +46,8 @@ _DNS_PASSTHROUGH = {
 
 @pytest.fixture(autouse=True)
 def stub_dispatch_dns(monkeypatch):
-    """派发前会解析出站主机名并做地址分类；默认给一个公网地址，避免用例依赖真实 DNS。
+    """派发前会解析出站主机名并做地址分类；默认给一个真正的公网地址（93.184.216.34，非私有段），
+    避免用例依赖真实 DNS，也避免"私有段默认放行"把 allowlist 之类的断言变成空测。
 
     需要真解析的主机（测试用 MySQL 容器）走透传；专测地址分类的用例在自己的 monkeypatch 里覆盖。
     """
