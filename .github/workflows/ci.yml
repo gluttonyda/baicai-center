@@ -1,0 +1,150 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: pytest (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # pinned: releases-v4 head
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # pinned: v5 tag
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      # 发行版 apt 中的 rclone 1.60 不支持用例里带 @ 的 remote 名，必须用官方构建。
+      - name: Install rclone (official build)
+        run: |
+          curl -fsSL https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/rclone.zip
+          unzip -q /tmp/rclone.zip -d /tmp/rclone
+          sudo install -m 0755 /tmp/rclone/rclone-*/rclone /usr/local/bin/rclone
+          rclone version | head -1
+          version=$(rclone version | head -1 | sed -E 's/^rclone v([0-9]+)\.([0-9]+).*/\1 \2/')
+          printf '%s' "$version" | grep -Eq '^[0-9]+ [0-9]+$' || {
+            echo "::error::could not parse rclone version output"
+            exit 1
+          }
+          set -- $version
+          if [ "${1:-0}" -lt 1 ] || { [ "$1" -eq 1 ] && [ "${2:-0}" -lt 65 ]; }; then
+            echo "::error::rclone must be >= 1.65 (remote names containing @ are unsupported in older builds)"
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      # Worker journal 默认写 /opt/baicai-worker（仅 root 可创建），托管 runner 是非 root，
+      # 不覆盖会 PermissionError。Scanner 缓存由用例自行 patch，无需设置。
+      - name: Run test suite
+        env:
+          PYTHONPATH: .:baicai-work
+          TASK_JOURNAL_DB_PATH: ${{ runner.temp }}/baicai-ci/task_journal.db
+        run: python -m pytest tests -q -ra
+
+      - name: Require rclone integration tests to run
+        env:
+          PYTHONPATH: .:baicai-work
+          TASK_JOURNAL_DB_PATH: ${{ runner.temp }}/baicai-ci/task_journal.db
+        run: |
+          set -o pipefail
+          status=0
+          output=$(python -m pytest tests/test_worker_integration.py -q -rs 2>&1) || status=$?
+          echo "$output"
+          if [ "$status" -ne 0 ]; then
+            echo "::error::rclone integration tests failed"
+            exit "$status"
+          fi
+          if printf '%s' "$output" | grep -q 'SKIPPED'; then
+            echo "::error::rclone integration tests were skipped; CI must exercise them"
+            exit 1
+          fi
+
+  image:
+    name: docker image (non-root)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # pinned: releases-v4 head
+
+      - name: Build Center image
+        run: docker build -t baicai-center:ci .
+
+      - name: Assert container runs as non-root
+        run: |
+          uid=$(docker run --rm --entrypoint id baicai-center:ci -u)
+          echo "container uid=$uid"
+          test "$uid" != "0"
+
+      - name: Assert runtime image has no pytest
+        run: |
+          present=$(docker run --rm --entrypoint python baicai-center:ci -c "import importlib.util as u; print(u.find_spec('pytest') is not None)")
+          echo "pytest_present=$present"
+          test "$present" = "False"
+
+      - name: Assert app imports inside image
+        run: |
+          docker run --rm --entrypoint python \
+            -e API_TOKEN=ci-token \
+            -e DB_HOST=127.0.0.1 \
+            -e DB_USER=ci-user \
+            -e DB_PASSWORD=ci-password \
+            -e DB_NAME=ci-db \
+            baicai-center:ci -c "import main; print('import ok')"
+
+  worker-image:
+    name: worker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # pinned: releases-v4 head
+
+      - name: Build Worker image
+        run: docker build -t baicai-worker:ci ./baicai-work
+
+      - name: Report worker image rclone version
+        run: docker run --rm --entrypoint rclone baicai-worker:ci version | head -1
+
+      - name: Assert worker imports and has no unused dependencies
+        run: |
+          docker run --rm --entrypoint python \
+            -e NODE_TOKEN=test-node-token-at-least-32-characters \
+            -e CENTER_URL=http://127.0.0.1:8080 \
+            -e TARGET_REMOTE_DIR=probe \
+            -e WORKER_NODE_NAME=probe-node \
+            baicai-worker:ci -c "import worker; print('worker import ok')"
+          docker run --rm --entrypoint python \
+            -e CENTER_API=http://127.0.0.1:8080/api \
+            -e WORKER_API_URL=http://127.0.0.1:8001/task/upload \
+            -e NODE_TOKEN=test-node-token-at-least-32-characters \
+            -e TARGET_REMOTE_DIR=probe \
+            -e WORKER_NODE_NAME=probe-node \
+            -e TASK_JOURNAL_DB_PATH=/tmp/baicai-ci/task_journal.db \
+            -e CACHE_DB_PATH=/tmp/baicai-ci/scanner_cache.db \
+            baicai-worker:ci -c "import scanner; print('scanner import ok')"
+          unexpected=$(docker run --rm --entrypoint python \
+            -e NODE_TOKEN=test-node-token-at-least-32-characters \
+            -e CENTER_URL=http://127.0.0.1:8080 \
+            -e TARGET_REMOTE_DIR=probe \
+            -e WORKER_NODE_NAME=probe-node \
+            baicai-worker:ci -c "import importlib.util as u; print(sorted(m for m in ('pytest','pymysql','cryptography','apscheduler','dbutils') if u.find_spec(m) is not None))")
+          echo "unexpected_modules=$unexpected"
+          test "$unexpected" = "[]"

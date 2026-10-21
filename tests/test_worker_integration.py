@@ -1,9 +1,11 @@
 from pathlib import Path
 from unittest.mock import patch
 import os
+import shutil
 import sys
 import tempfile
 
+import pytest
 from fastapi.testclient import TestClient
 
 os.environ.setdefault("API_TOKEN", "test-token")
@@ -18,6 +20,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import worker
 
 client = TestClient(worker.app)
+
+# Worker 按 PATH 调用 rclone；这些用例只访问本地临时目录，但需要真实可执行文件。
+requires_rclone = pytest.mark.skipif(
+    shutil.which("rclone") is None,
+    reason="PATH 中未找到 rclone：按 https://rclone.org/install/ 安装与生产一致的 1.65 及以上版本"
+    "（发行版 apt 中的 1.60 不支持用例里带 @ 的 remote 名）并加入 PATH 后重新运行",
+)
 
 
 def auth_headers():
@@ -86,6 +95,7 @@ def test_receive_task_clean_routes_to_background_worker():
     )
 
 
+@requires_rclone
 def test_worker_rclone_upload_and_clean_round_trip():
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)
@@ -130,6 +140,7 @@ def test_worker_rclone_upload_and_clean_round_trip():
             assert clean_reports[-1][:2] == ("baicai-1@1-3", "clean_success")
 
 
+@requires_rclone
 def test_worker_rclone_clean_moves_only_requested_files():
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)

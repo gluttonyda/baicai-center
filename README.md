@@ -2,7 +2,7 @@
 
 Baicai Center 是一个用于分布式 Google Drive 搬运的主控调度系统。
 
-本次版本变化见 [中文更新日志](CHANGELOG.md)、[2026-10-21 调度互斥与鉴权加固说明](docs/CODE_CHANGES_20261021.md) 和 [2026-09-14 代码差异说明](docs/CODE_CHANGES_20260914.md)。
+本次版本变化见 [中文更新日志](CHANGELOG.md)、[2026-10-21 依赖拆分与运行时加固说明](docs/CODE_CHANGES_20261021_runtime.md)、[2026-10-21 调度互斥与鉴权加固说明](docs/CODE_CHANGES_20261021.md) 和 [2026-09-14 代码差异说明](docs/CODE_CHANGES_20260914.md)。
 
 它的核心目标是让一个中心节点充当“主控大脑”，统一接收文件清单、管理账号池、调度多个地区的 Worker 节点，并在 Google Drive 上传配额触发后自动切换账号继续搬运。
 
@@ -281,15 +281,16 @@ python scripts/compare_worker_cache_paths.py --worker-node worker-node-1 --local
 
 ## 测试
 
-本仓库的测试需要同时把根目录和 `baicai-work/` 放进 `PYTHONPATH`：
+依赖分为两份：`requirements.txt` 只包含运行时依赖，Center 镜像只安装这一份；`requirements-dev.txt` 包含 pytest 等开发和测试依赖。开发机同时安装两者，测试需要同时把根目录和 `baicai-work/` 放进 `PYTHONPATH`：
 
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-pip install -r requirements.txt
-pip install -r baicai-work/requirements.txt
+pip install -r requirements.txt -r requirements-dev.txt
 PYTHONPATH=.:baicai-work pytest -q
 ```
+
+Center 镜像以非 root 用户 `baicai`（uid/gid 10001）运行；Worker 镜像暂时仍以 root 运行，原因见 [2026-10-21 依赖拆分与运行时加固说明](docs/CODE_CHANGES_20261021_runtime.md#worker-仍以-root-运行)。
 
 `tests/test_mysql_integration.py` 需要真实 MySQL 8。未设置下列环境变量时，这些用例显示为 skipped，不会失败：
 
@@ -301,7 +302,9 @@ BAICAI_TEST_MYSQL_DATABASE=baicai_review \
 PYTHONPATH=.:baicai-work pytest -q tests/test_mysql_integration.py
 ```
 
-每个用例都会创建 `review_` 前缀的临时库并在结束后删除，测试账号需要建库和删库权限，不要指向生产实例。`tests/test_worker_integration.py` 的 cleaner 用例会调用 `PATH` 中的真实 `rclone`（只访问本地临时目录）。
+每个用例都会创建 `review_` 前缀的临时库并在结束后删除，测试账号需要建库和删库权限，不要指向生产实例。`tests/test_worker_integration.py` 的 2 个 rclone 用例会调用 `PATH` 中的真实 `rclone`（建议与生产一致使用 1.65 及以上，只访问本地临时目录）；找不到 `rclone` 时显示为 skipped，`pytest -ra` 会输出安装方式。发布前应在有 rclone 的环境中确认它们是 passed。
+
+`scripts/reset_db.py` 会清空任务数据，必须显式确认：`--dry-run` 只读预览，`--yes` 用于非交互环境；不传 `--yes` 时只有在交互终端中输入数据库名才会执行。用法与兼容影响见 [变更说明](docs/CODE_CHANGES_20261021_runtime.md#scriptsreset_dbpy)。
 
 测试数量会随协议和回归用例调整，以 `pytest` 最终输出为准，不在文档中维护容易失真的固定数字。
 
