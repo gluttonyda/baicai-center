@@ -2108,3 +2108,20 @@ def test_report_status_completed_for_v1_worker_keeps_batch_semantics(mock_db, ca
     assert response.status_code == 200
     mock_mark_all.assert_called_once()
     assert any("协议版本 <2" in record.getMessage() for record in caplog.records)
+
+
+def test_normalized_path_expression_has_no_backslash_escapes():
+    """SQL 侧正则不能依赖反斜杠：MySQL 字面量会吃掉单层转义，模式会退化。
+
+    CI 不跑真库用例，这条纯字符串断言用来在无数据库环境下兜住同类回归。
+    """
+    expression = main._normalized_path_expression("file_path")
+
+    assert "\\" not in expression
+    assert expression == "TRIM(LEADING '/' FROM REGEXP_REPLACE(file_path, '^([.]/)+', ''))"
+
+
+def test_normalize_relative_path_strips_leading_dot_slash_and_slash():
+    assert main.normalize_relative_path("./movie/dot.mkv") == "movie/dot.mkv"
+    assert main.normalize_relative_path("/movie/slash.mkv") == "movie/slash.mkv"
+    assert main.normalize_relative_path("movie/plain.mkv") == "movie/plain.mkv"
