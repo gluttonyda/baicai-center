@@ -2087,3 +2087,22 @@ def test_run_uploader_wires_move_delete_and_reports_already_present(monkeypatch,
         already_present_files=["movie.mkv"],
     )
     assert not target.exists()
+
+
+def test_remote_mtime_tolerance_is_clamped():
+    """环境变量被写成离谱值或非数字时不能让模块崩溃，也不能让"大小相同即已存在"。"""
+    import subprocess
+
+    worker_dir = Path(__file__).resolve().parents[1] / "baicai-work"
+    for raw, expected in (("99", 1.0), ("-5", 0.0), ("0.5", 0.5), ("abc", 0.001)):
+        env = dict(os.environ, REMOTE_MTIME_TOLERANCE_SECONDS=raw, PYTHONPATH=str(worker_dir))
+        completed = subprocess.run(
+            [sys.executable, "-c", "import worker; print(worker.REMOTE_MTIME_TOLERANCE_SECONDS)"],
+            cwd=str(worker_dir),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert float(completed.stdout.strip()) == expected, raw

@@ -1026,7 +1026,9 @@ def mark_successful_uploads_by_files(
         updated_ids.extend(int(row["id"]) for row in (cursor.fetchall() or []))
     if already_present_files and len(already_present_files) > max(100, int(0.9 * len(file_paths))):
         # 探测逻辑退化时不但会假成功，还会同时少计用量（放宽 750GB/日 的保护），留个可观测信号。
-        logger.warning(
+        # 整批全命中在重试场景是合法的，降为 info 避免心跳重复刷警告。
+        ratio_log = logger.info if len(already_present_files) == len(file_paths) else logger.warning
+        ratio_log(
             "📉 账号 [%s] 本次回执中 %s/%s 个文件被判定为远端已存在，请留意探测结果是否符合预期。",
             account_name,
             len(already_present_files),
