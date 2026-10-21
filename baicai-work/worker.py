@@ -55,7 +55,11 @@ REMOTE_PROBE_TIMEOUT_SECONDS = max(1, int(os.getenv("REMOTE_PROBE_TIMEOUT_SECOND
 # 远端 mtime 比对容差：drive 后端的 ModTimePrecision 是毫秒，rclone 自己判 "unchanged" 也按这个精度。
 # 窗口放大会把「大小相同、mtime 相差不到 1 秒、内容其实已改」的文件当成已存在而跳过上传。
 # 可配置：接入秒级精度的后端（非 drive）时调大，否则会每次派发都重传。
-REMOTE_MTIME_TOLERANCE_SECONDS = float(os.getenv("REMOTE_MTIME_TOLERANCE_SECONDS", "0.001"))
+# 钳制在 [0, 1]：过大的取值会让"大小相同即视为已存在"，整批假成功；非法取值回退默认。
+try:
+    REMOTE_MTIME_TOLERANCE_SECONDS = min(1.0, max(0.0, float(os.getenv("REMOTE_MTIME_TOLERANCE_SECONDS", "0.001"))))
+except ValueError:
+    REMOTE_MTIME_TOLERANCE_SECONDS = 0.001
 NODE_SIGNATURE_MAX_AGE_SECONDS = max(30, int(os.getenv("NODE_SIGNATURE_MAX_AGE_SECONDS", "300")))
 RCLONE_BWLIMIT = os.getenv("RCLONE_BWLIMIT", "").strip()
 RCLONE_TRANSFERS = max(1, int(os.getenv("RCLONE_TRANSFERS", "4")))
@@ -653,20 +657,6 @@ def report_heartbeat(
         return False
 
 
-def flush_cleaner_success_batch(account_name: str, status: str, batch: list[str]) -> bool:
-    try:
-        if batch:
-            report_status(account_name, status, list(batch))
-            batch.clear()
-        else:
-            report_status(account_name, status)
-        return True
-    except ReportStatusError:
-        if status == "uploading":
-            logger.warning("🧹 [%s] 分批进度回执失败，保留批次并继续搬运。", account_name)
-            return False
-        raise
-
 
 def skip_already_uploaded_files(
     account_name: str,
@@ -851,53 +841,6 @@ def detect_remote_existing_files(
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
-
-def detect_cleaner_dest_existing_files(
-    dest_name: str, files_from_path: str, remote_dir: Optional[str] = None
-) -> set[str]:
-    target_remote_dir = remote_dir or TARGET_REMOTE_DIR
-    try:
-        result = subprocess.run(
-            [
-                "rclone",
-                "lsf",
-                f"{dest_name}:{target_remote_dir}",
-                "--files-from-raw",
-                files_from_path,
-                "--files-only",
-                "--recursive",
-                "--format",
-                "p",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=REMOTE_PROBE_TIMEOUT_SECONDS,
-        )
-        if result.returncode != 0:
-            logger.warning(
-                "🧹 目标盘存在性复核失败: %s -> %s（退出码=%s）\n%s",
-                dest_name,
-                target_remote_dir,
-                result.returncode,
-                (result.stderr or result.stdout).strip(),
-            )
-            return set()
-
-        return {
-            line.replace("\\", "/")
-            for line in result.stdout.splitlines()
-            if line
-        }
-    except subprocess.TimeoutExpired:
-        logger.warning("🧹 [%s] cleaner 目标盘复核超时。", dest_name)
-        return set()
-    except FileNotFoundError:
-        logger.error("❌ 未找到 rclone 命令，无法执行 cleaner 目标盘复核。")
-        return set()
-    except Exception as e:
-        logger.warning("🧹 cleaner 目标盘复核异常，将按原始 rclone 结果处理: %s", e)
-        return set()
 
 
 def resolve_cleaner_destination_remote(
@@ -1096,6 +1039,14 @@ def run_uploader(
         if recovered_remote_files:
             for file_path in recovered_remote_files:
                 mark_success(file_path)
+            if expected_size_by_path is None:
+                # 历史任务没有 size_bytes 指纹：这里只能按文件名匹配（既有行为），
+                # 没有传输过就不计用量，但要把"无指纹"这件事记下来。
+                logger.warning(
+                    "⚠️ 账号 [%s] 有 %s 个本地缺失文件仅按文件名判定已在远端（Center 未提供尺寸指纹），请留意。",
+                    account_name,
+                    len(recovered_remote_files),
+                )
             already_present_files.extend(sorted(recovered_remote_files))
             missing_files = [fp for fp in missing_files if fp not in recovered_remote_files]
             logger.warning(
