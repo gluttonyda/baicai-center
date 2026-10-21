@@ -2168,3 +2168,60 @@ def test_success_path_sql_contract_placeholder_counts():
     for call in cursor.execute.call_args_list:
         sql, params = call.args[0], call.args[1]
         assert sql.count("%s") == len(params), sql[:120]
+
+
+def test_report_status_request_validates_already_present_files():
+    from fastapi import HTTPException  # noqa: F401  （仅用于说明返回码约定）
+
+    accepted = main.ReportStatusRequest(
+        account_name="baicai_1@1",
+        status="completed",
+        successful_files=["movie/a.mkv"],
+        already_present_files=["movie/a.mkv"],
+    )
+    assert accepted.already_present_files == ["movie/a.mkv"]
+
+    with pytest.raises(ValueError):
+        main.ReportStatusRequest(
+            account_name="baicai_1@1",
+            status="completed",
+            already_present_files=["bad\npath.mkv"],
+        )
+
+
+def test_report_status_heartbeat_forwards_already_present_files(mock_db):
+    """心跳（status=uploading）也会结算 successful_files，必须同样透传已存在清单，否则会被计费。"""
+    dispatch_id = "7" * 32
+    mock_db.fetchone.return_value = {
+        "role": "uploader",
+        "current_dispatch_id": dispatch_id,
+        "current_worker_node": "worker-node-1",
+    }
+    payload = {
+        "account_name": "baicai_1@1",
+        "status": "uploading",
+        "dispatch_id": dispatch_id,
+        "worker_node": "worker-node-1",
+        "successful_files": ["movie/a.mkv", "movie/b.mkv"],
+        "already_present_files": ["movie/a.mkv"],
+    }
+
+    with patch("main.refresh_uploader_heartbeat", return_value=(0, 0, 1)), patch(
+        "main.mark_successful_uploads_by_files"
+    ) as mark_successful:
+        response = client.post("/api/report_status", json=payload, headers=auth_headers())
+
+    assert response.status_code == 200
+    mark_successful.assert_called_once()
+    assert mark_successful.call_args.kwargs["already_present_files"] == ["movie/a.mkv"]
+
+
+def test_report_status_request_rejects_already_present_outside_successful_files():
+    """Worker 是信任边界：已存在清单必须是成功清单的子集，否则等于凭空少计用量。"""
+    with pytest.raises(ValueError):
+        main.ReportStatusRequest(
+            account_name="baicai_1@1",
+            status="completed",
+            successful_files=["movie/a.mkv"],
+            already_present_files=["movie/b.mkv"],
+        )

@@ -27,6 +27,22 @@ from fastapi.testclient import TestClient
 client = TestClient(worker.app)
 
 
+_REAL_SKIP_ALREADY_UPLOADED = worker.skip_already_uploaded_files
+
+
+@pytest.fixture(autouse=True)
+def _disable_remote_present_probe(monkeypatch):
+    """这些单元用例把 rclone 进程整体 mock 掉，额外的 lsjson 复核会打乱它们的调用序列。
+
+    远端存在性复核的真实行为由 tests/test_worker_integration.py 里的真 rclone 用例覆盖。
+    """
+    monkeypatch.setattr(
+        worker,
+        "skip_already_uploaded_files",
+        lambda account_name, base_dir, file_paths, remote_dir, mark_success, delete_local=False, **_: file_paths,
+    )
+
+
 def test_resolve_task_path_rejects_path_traversal():
     assert worker.resolve_task_path("../etc/passwd") is None
 
@@ -52,7 +68,7 @@ def test_run_uploader_reports_not_found_when_no_local_files():
         worker.run_uploader("baicai_1@1", ["missing/file.mkv"], "move")
 
     mock_report_status.assert_called_once_with(
-        "baicai_1@1", "not_found", [], ["missing/file.mkv"]
+        "baicai_1@1", "not_found", [], ["missing/file.mkv"], already_present_files=[]
     )
 
 
@@ -62,7 +78,7 @@ def test_run_uploader_ignores_clfstmp_files():
 
     mock_resolve_task_path.assert_not_called()
     mock_report_status.assert_called_once_with(
-        "baicai_1@1", "not_found", [], ["movie/downloading.CLFSTMP"]
+        "baicai_1@1", "not_found", [], ["movie/downloading.CLFSTMP"], already_present_files=[]
     )
 
 
@@ -76,6 +92,7 @@ def test_run_uploader_ignores_clfstmp_progress_files():
         "not_found",
         [],
         ["movie/downloading.mkv.clfstmp.progress"],
+        already_present_files=[],
     )
 
 
@@ -960,7 +977,14 @@ def test_run_uploader_move_recovers_remote_existing_missing_files():
     with patch("worker.detect_remote_existing_files", return_value={"missing/file.mkv"}), patch("worker.report_status") as mock_report_status:
         worker.run_uploader("baicai_1@1", ["missing/file.mkv"], "move")
 
-    mock_report_status.assert_called_once_with("baicai_1@1", "completed", ["missing/file.mkv"], [])
+    # 远端命中的文件属于"已存在"，回执里单列，Center 不会为它记用量。
+    mock_report_status.assert_called_once_with(
+        "baicai_1@1",
+        "completed",
+        ["missing/file.mkv"],
+        [],
+        already_present_files=["missing/file.mkv"],
+    )
 
 
 def test_run_uploader_reports_remote_partial_success_with_remaining_missing_files():
@@ -976,6 +1000,7 @@ def test_run_uploader_reports_remote_partial_success_with_remaining_missing_file
         "not_found",
         ["movie/already-moved.mkv"],
         ["movie/still-missing.mkv"],
+        already_present_files=["movie/already-moved.mkv"],
     )
 
 
@@ -997,7 +1022,7 @@ def test_run_uploader_rejects_local_file_changed_after_dispatch():
 
     mock_popen.assert_not_called()
     mock_report_status.assert_called_once_with(
-        "baicai_1@1", "not_found", [], ["movie/a.mkv"]
+        "baicai_1@1", "not_found", [], ["movie/a.mkv"], already_present_files=[]
     )
 
 
@@ -1487,11 +1512,14 @@ def test_remote_probe_accepts_rclone_nanosecond_modtime():
     # rclone lsjson 的 ModTime 固定 9 位小数秒（实测 v1.65），Python 3.10 的 fromisoformat 不接受。
     remote_items = [
         {"Path": "#hash.txt", "Size": 200, "ModTime": "1970-01-01T00:16:40.000000000Z"},
-        {"Path": " spaced.txt ", "Size": 200, "ModTime": "1970-01-01T08:16:40.500000000+08:00"},
+        # +08:00 且带纳秒：同一时刻，必须能解析并命中。
+        {"Path": " spaced.txt ", "Size": 200, "ModTime": "1970-01-01T08:16:40.000000000+08:00"},
+        # 偏差 0.5 秒：容差按 drive 毫秒精度（1ms），不能再当成同一文件。
+        {"Path": "half-second.txt", "Size": 200, "ModTime": "1970-01-01T00:16:40.500000000Z"},
         {"Path": "old.txt", "Size": 200, "ModTime": "1970-01-01T00:16:43.000000000Z"},
     ]
     result = MagicMock(returncode=0, stdout=json.dumps(remote_items), stderr="")
-    paths = ["#hash.txt", " spaced.txt ", "old.txt"]
+    paths = ["#hash.txt", " spaced.txt ", "half-second.txt", "old.txt"]
 
     with patch("worker.subprocess.run", return_value=result) as mock_run:
         existing = worker.detect_remote_existing_files(
@@ -1917,3 +1945,145 @@ def test_run_uploader_treats_error_level_credential_failure_as_invalid(caplog):
 def test_unrecognized_formats_fall_back_to_legacy_detection(line):
     """格式不认识时必须回退成旧行为（返回 True），宁可误判也不能漏判真实错误。"""
     assert worker.is_error_level_line(line) is True
+
+
+def test_skip_already_uploaded_only_probes_paths_with_local_fingerprint(monkeypatch, tmp_path):
+    """无本地指纹的路径（并发被删）不能被"仅按文件名"判定为已存在。"""
+    monkeypatch.setattr(worker, "skip_already_uploaded_files", _REAL_SKIP_ALREADY_UPLOADED)
+    base = tmp_path / "src"
+    base.mkdir()
+    (base / "present.txt").write_text("x", encoding="utf-8")
+    marked = []
+
+    with patch("worker.detect_remote_existing_files", return_value={"present.txt", "ghost.txt"}) as probe:
+        remaining = _REAL_SKIP_ALREADY_UPLOADED(
+            "baicai_1@1", str(base), ["present.txt", "ghost.txt"], None, marked.append
+        )
+
+    assert probe.call_args.args[1] == ["present.txt"]
+    assert marked == ["present.txt"]
+    assert remaining == ["ghost.txt"]
+
+
+def test_skip_already_uploaded_returns_all_when_no_fingerprint_available(monkeypatch, tmp_path):
+    monkeypatch.setattr(worker, "skip_already_uploaded_files", _REAL_SKIP_ALREADY_UPLOADED)
+    base = tmp_path / "src"
+    base.mkdir()
+    marked = []
+
+    with patch("worker.detect_remote_existing_files") as probe:
+        remaining = _REAL_SKIP_ALREADY_UPLOADED("baicai_1@1", str(base), ["ghost.txt"], None, marked.append)
+
+    probe.assert_not_called()
+    assert remaining == ["ghost.txt"]
+    assert marked == []
+
+
+def test_skip_already_uploaded_skips_probe_when_lease_lost(monkeypatch, tmp_path):
+    monkeypatch.setattr(worker, "skip_already_uploaded_files", _REAL_SKIP_ALREADY_UPLOADED)
+    base = tmp_path / "src"
+    base.mkdir()
+    (base / "a.txt").write_text("x", encoding="utf-8")
+    marked = []
+    worker.cancel_dispatch("dispatch-lost")
+    try:
+        with patch("worker.detect_remote_existing_files") as probe:
+            remaining = _REAL_SKIP_ALREADY_UPLOADED(
+                "baicai_1@1", str(base), ["a.txt"], None, marked.append, dispatch_id="dispatch-lost"
+            )
+    finally:
+        worker.clear_dispatch_cancellation("dispatch-lost")
+
+    probe.assert_not_called()
+    assert remaining == ["a.txt"]
+    assert marked == []
+
+
+def test_skip_already_uploaded_refuses_delete_outside_base(monkeypatch, tmp_path):
+    """delete_local 不能越界删文件，但仍要记账成功。"""
+    monkeypatch.setattr(worker, "skip_already_uploaded_files", _REAL_SKIP_ALREADY_UPLOADED)
+    base = tmp_path / "src"
+    base.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("keep me", encoding="utf-8")
+    marked = []
+
+    with patch("worker.detect_remote_existing_files", return_value={"../outside.txt"}):
+        remaining = _REAL_SKIP_ALREADY_UPLOADED(
+            "baicai_1@1", str(base), ["../outside.txt"], None, marked.append, delete_local=True
+        )
+
+    assert outside.exists()
+    assert marked == ["../outside.txt"]
+    assert remaining == []
+
+
+def test_skip_already_uploaded_deletes_local_copy_in_move_mode(monkeypatch, tmp_path):
+    monkeypatch.setattr(worker, "skip_already_uploaded_files", _REAL_SKIP_ALREADY_UPLOADED)
+    base = tmp_path / "src"
+    base.mkdir()
+    target = base / "movie.mkv"
+    target.write_text("data", encoding="utf-8")
+    marked = []
+
+    with patch("worker.detect_remote_existing_files", return_value={"movie.mkv"}):
+        remaining = _REAL_SKIP_ALREADY_UPLOADED(
+            "baicai_1@1", str(base), ["movie.mkv"], None, marked.append, delete_local=True
+        )
+
+    assert not target.exists()
+    assert marked == ["movie.mkv"]
+    assert remaining == []
+
+
+def test_report_status_payload_includes_already_present_files():
+    """回执要带上"已存在未传输"的清单，Center 才能把它们排除在用量统计外。"""
+    with patch("worker._post_report_payload") as post:
+        worker.report_status(
+            "baicai_1@1", "uploading", ["movie/a.mkv"], [], already_present_files=["movie/b.mkv"]
+        )
+
+    payload = post.call_args.args[0]
+    assert payload["already_present_files"] == ["movie/b.mkv"]
+    assert payload["successful_files"] == ["movie/a.mkv"]
+
+
+def test_report_heartbeat_forwards_already_present_files():
+    """心跳也要带上已存在清单：Center 对 uploading 状态同样会结算 successful_files。"""
+    with patch("worker.report_status") as mock_report:
+        assert worker.report_heartbeat("baicai_1@1", ["movie/a.mkv"], ["movie/a.mkv"]) is True
+
+    mock_report.assert_called_once_with(
+        "baicai_1@1",
+        "uploading",
+        ["movie/a.mkv"],
+        already_present_files=["movie/a.mkv"],
+    )
+
+
+def test_run_uploader_wires_move_delete_and_reports_already_present(monkeypatch, tmp_path):
+    """接线验证：run_uploader 要把 move 语义与已存在清单真正传到助手与回执里。
+
+    （其余单元用例把 skip 助手整体置为直通，这条专门覆盖接线。）
+    """
+    monkeypatch.setattr(worker, "skip_already_uploaded_files", _REAL_SKIP_ALREADY_UPLOADED)
+    base = tmp_path / "src"
+    base.mkdir()
+    target = base / "movie.mkv"
+    target.write_text("data", encoding="utf-8")
+
+    with patch("worker.ALLOWED_BASE_DIRS", [str(base)]), patch(
+        "worker.resolve_task_path", return_value=(str(base), "movie.mkv")
+    ), patch("worker.detect_remote_existing_files", return_value={"movie.mkv"}), patch(
+        "worker.report_status"
+    ) as mock_report:
+        worker.run_uploader("baicai_1@1", ["movie.mkv"], "move")
+
+    mock_report.assert_called_once_with(
+        "baicai_1@1",
+        "completed",
+        ["movie.mkv"],
+        [],
+        already_present_files=["movie.mkv"],
+    )
+    assert not target.exists()

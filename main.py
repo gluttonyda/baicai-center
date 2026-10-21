@@ -494,6 +494,21 @@ class ReportStatusRequest(BaseModel):
     worker_node: Optional[str] = Field(default=None, min_length=1, max_length=128)
     successful_files: List[str] = Field(default_factory=list)
     missing_files: List[str] = Field(default_factory=list)
+    # 远端已存在、本次没有真正传输的文件：标记成功但不计用量。
+    already_present_files: List[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_already_present_subset(self):
+        """already_present_files 会"标记成功但不计费"，必须是被报告成功的文件中挑出来的子集。
+
+        Worker 是信任边界，这里强制交叉校验：否则探测逻辑退化时不但会假成功，
+        还会同时少计用量，放宽 750GB/日 的配额保护。
+        """
+        if self.already_present_files:
+            missing = [path for path in self.already_present_files if path not in self.successful_files]
+            if missing:
+                raise ValueError(f"already_present_files 必须是 successful_files 的子集，越界示例: {missing[0]}")
+        return self
 
     @model_validator(mode="after")
     def validate_dispatch_identity(self):
@@ -529,6 +544,11 @@ class ReportStatusRequest(BaseModel):
                 raise ValueError("successful_files 中存在非法路径")
             normalized_files.append(file_path)
         return normalized_files
+
+    @field_validator("already_present_files")
+    @classmethod
+    def validate_already_present_files(cls, value: List[str]) -> List[str]:
+        return cls.validate_successful_files(value)
 
     @field_validator("missing_files")
     @classmethod
@@ -960,10 +980,18 @@ def mark_successful_uploads_by_files(
     target_status: str,
     file_paths: List[str],
     dispatch_id: Optional[str] = None,
+    already_present_files: Optional[List[str]] = None,
 ):
     if not file_paths:
         return
     task_ids = resolve_successful_task_ids(cursor, account_name, file_paths, dispatch_id)
+    # 已存在的文件没有真正传输，不能计入当日上传用量：在 UPDATE 之前解析它们的 id
+    # （UPDATE 之后这些行已不是 uploading，再查就查不到了）。
+    non_billable_ids = set()
+    if already_present_files:
+        non_billable_ids = set(
+            resolve_successful_task_ids(cursor, account_name, already_present_files, dispatch_id)
+        )
     updated_ids: List[int] = []
     for start in range(0, len(task_ids), MAX_SUCCESSFUL_FILES):
         chunk = task_ids[start:start + MAX_SUCCESSFUL_FILES]
@@ -996,7 +1024,17 @@ def mark_successful_uploads_by_files(
             chunk + [account_name, target_status],
         )
         updated_ids.extend(int(row["id"]) for row in (cursor.fetchall() or []))
-    record_upload_usage_events_for_task_ids(cursor, account_name, updated_ids, dispatch_id)
+    if already_present_files and len(already_present_files) > max(100, int(0.9 * len(file_paths))):
+        # 探测逻辑退化时不但会假成功，还会同时少计用量（放宽 750GB/日 的保护），留个可观测信号。
+        logger.warning(
+            "📉 账号 [%s] 本次回执中 %s/%s 个文件被判定为远端已存在，请留意探测结果是否符合预期。",
+            account_name,
+            len(already_present_files),
+            len(file_paths),
+        )
+
+    billable_ids = [task_id for task_id in updated_ids if task_id not in non_billable_ids]
+    record_upload_usage_events_for_task_ids(cursor, account_name, billable_ids, dispatch_id)
 
 
 def count_uploading_tasks(cursor, account_name: str, dispatch_id: Optional[str]) -> int:
@@ -2370,6 +2408,7 @@ def receive_worker_report(req: ReportStatusRequest, node_auth: dict[str, Optiona
                         success_target_status,
                         req.successful_files,
                         req.dispatch_id,
+                        already_present_files=req.already_present_files,
                     )
 
             if req.missing_files:
