@@ -54,7 +54,8 @@ REMOTE_PROBE_TIMEOUT_SECONDS = max(1, int(os.getenv("REMOTE_PROBE_TIMEOUT_SECOND
 
 # 远端 mtime 比对容差：drive 后端的 ModTimePrecision 是毫秒，rclone 自己判 "unchanged" 也按这个精度。
 # 窗口放大会把「大小相同、mtime 相差不到 1 秒、内容其实已改」的文件当成已存在而跳过上传。
-REMOTE_MTIME_TOLERANCE_SECONDS = 0.001
+# 可配置：接入秒级精度的后端（非 drive）时调大，否则会每次派发都重传。
+REMOTE_MTIME_TOLERANCE_SECONDS = float(os.getenv("REMOTE_MTIME_TOLERANCE_SECONDS", "0.001"))
 NODE_SIGNATURE_MAX_AGE_SECONDS = max(30, int(os.getenv("NODE_SIGNATURE_MAX_AGE_SECONDS", "300")))
 RCLONE_BWLIMIT = os.getenv("RCLONE_BWLIMIT", "").strip()
 RCLONE_TRANSFERS = max(1, int(os.getenv("RCLONE_TRANSFERS", "4")))
@@ -634,9 +635,18 @@ def report_status(
     raise ReportStatusError(f"战况汇报失败: {account} -> {status}") from last_error
 
 
-def report_heartbeat(account_name: str, successful_files: Optional[List[str]] = None) -> bool:
+def report_heartbeat(
+    account_name: str,
+    successful_files: Optional[List[str]] = None,
+    already_present_files: Optional[List[str]] = None,
+) -> bool:
     try:
-        report_status(account_name, "uploading", successful_files)
+        report_status(
+            account_name,
+            "uploading",
+            successful_files,
+            already_present_files=already_present_files,
+        )
         return True
     except ReportStatusError as error:
         logger.warning("💓 [%s] 心跳暂时无法送达，rclone 继续运行: %s", account_name, error)
@@ -1107,6 +1117,7 @@ def run_uploader(
                 "not_found",
                 successful_files,
                 missing_files or files,
+                already_present_files=already_present_files,
             )
         return
 
@@ -1184,7 +1195,7 @@ def run_uploader(
 
                         if current_time - last_report_time > 300:
                             logger.info(f"💓 [{account_name}] 任务执行中... 汇报活跃状态防失联。")
-                            report_heartbeat(account_name, successful_files)
+                            report_heartbeat(account_name, successful_files, already_present_files)
                             last_report_time = current_time
 
                         events = selector.select(timeout=1.0)

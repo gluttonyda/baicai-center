@@ -498,6 +498,19 @@ class ReportStatusRequest(BaseModel):
     already_present_files: List[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
+    def validate_already_present_subset(self):
+        """already_present_files 会"标记成功但不计费"，必须是被报告成功的文件中挑出来的子集。
+
+        Worker 是信任边界，这里强制交叉校验：否则探测逻辑退化时不但会假成功，
+        还会同时少计用量，放宽 750GB/日 的配额保护。
+        """
+        if self.already_present_files:
+            missing = [path for path in self.already_present_files if path not in self.successful_files]
+            if missing:
+                raise ValueError(f"already_present_files 必须是 successful_files 的子集，越界示例: {missing[0]}")
+        return self
+
+    @model_validator(mode="after")
     def validate_dispatch_identity(self):
         if (self.dispatch_id is None) != (self.worker_node is None):
             raise ValueError("dispatch_id 和 worker_node 必须同时提供")
@@ -1011,6 +1024,15 @@ def mark_successful_uploads_by_files(
             chunk + [account_name, target_status],
         )
         updated_ids.extend(int(row["id"]) for row in (cursor.fetchall() or []))
+    if already_present_files and len(already_present_files) > max(100, int(0.9 * len(file_paths))):
+        # 探测逻辑退化时不但会假成功，还会同时少计用量（放宽 750GB/日 的保护），留个可观测信号。
+        logger.warning(
+            "📉 账号 [%s] 本次回执中 %s/%s 个文件被判定为远端已存在，请留意探测结果是否符合预期。",
+            account_name,
+            len(already_present_files),
+            len(file_paths),
+        )
+
     billable_ids = [task_id for task_id in updated_ids if task_id not in non_billable_ids]
     record_upload_usage_events_for_task_ids(cursor, account_name, billable_ids, dispatch_id)
 

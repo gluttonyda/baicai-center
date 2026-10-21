@@ -22,7 +22,7 @@ PR #10 之后 `completed` 回执只按 `successful_files` 标记成功，因此�
   - 期望指纹取自本地 `os.stat`，大小不一致或 mtime 偏差超过容差的**不会**被跳过，仍照常上传；
   - 探测结果与 `probe_paths` 取交集，清单外的名字一律不记账；
   - 复核失败（rclone 退出码非 0、超时、响应不是合法 JSON、格式异常）时返回原清单，退回"照常上传"，不会因为没有证据就误记成功。
-- mtime 容差从 1 秒收紧到 **1 毫秒**（`REMOTE_MTIME_TOLERANCE_SECONDS`）：drive 后端的 `ModTimePrecision` 是毫秒，rclone 自己判 "unchanged" 也按这个精度；1 秒窗口会把"大小相同、内容已改"的文件误判为已存在。
+- mtime 容差从 1 秒收紧到 **1 毫秒**（`REMOTE_MTIME_TOLERANCE_SECONDS`，可用环境变量覆盖）：drive 后端的 `ModTimePrecision` 是毫秒，rclone 自己判 "unchanged" 也按这个精度；1 秒窗口会把"大小相同、内容已改"的文件误判为已存在。接入秒级精度的后端时需要调大，否则会每次派发都重传。
 - 租约检查：探测前与每次删除本地文件前都检查 `is_dispatch_cancelled()`，租约已丢时不复检、不删本地。
 - `run_uploader()` 在每个 `base_dir` 分组进入 rclone 前调用它；整组都被结算时直接 `continue`，不再启动 rclone。
 - `move` 模式下顺带删除已结算文件的本地副本（带 `realpath` 越界保护）：move 的语义是搬完后本地消失，留着会被扫描器当成新文件重新入库，形成慢速重复上传。
@@ -30,7 +30,9 @@ PR #10 之后 `completed` 回执只按 `successful_files` 标记成功，因此�
 ## 派发协议：区分"已存在"与"已传输"
 
 - Worker 回执新增 `already_present_files` 字段（与 `successful_files` 独立），move 模式远端补偿命中的文件也计入。
-- Center 的 `ReportStatusRequest` 接受该字段（同样的路径校验：非空、长度 ≤1024、禁止 NUL/CR/LF、数量上限），`mark_successful_uploads_by_files()` 在 **UPDATE 之前**解析这些文件的 id，记账时排除。
+- **所有会带 `successful_files` 的回执都要带上它**：终态回执、`not_found` 回执、以及每 5 分钟的心跳（`report_heartbeat`）。心跳尤其关键——Center 对 `status=uploading` 的回执同样会结算 `successful_files`，漏传会让已存在文件在混合批次里被计费。
+- Center 的 `ReportStatusRequest` 接受该字段（同样的路径校验：非空、长度 ≤1024、禁止 NUL/CR/LF、数量上限），并**强制它必须是 `successful_files` 的子集**——Worker 是信任边界，否则探测退化时不但假成功、还会同时少计用量，放宽 750GB/日 的保护。
+- `mark_successful_uploads_by_files()` 在 **UPDATE 之前**解析这些文件的 id，记账时排除；单次回执中已存在占比超过 90%（且多于 100 个）时打 warning，便于发现探测逻辑退化。
 
 原因：这些文件本次**没有真正传输**，若照常按 `size_bytes` 记用量，会虚增 `/api/upload_usage` 与日用量曲线（历史积压一次性结算时尤其明显），干扰 750GB/日 的判断。
 
@@ -45,9 +47,9 @@ PR #10 之后 `completed` 回执只按 `successful_files` 标记成功，因此�
   - `test_worker_rclone_still_uploads_when_remote_copy_differs`：远端同名但大小不同 → 照常上传并覆盖内容，`already_present_files` 为空。
   - `test_worker_rclone_move_deletes_local_when_remote_already_present`：move 模式 → 记成功、本地副本被删除、远端文件保留。
 - 真库用例：`test_already_present_files_are_marked_but_not_billed` —— 两行都变 `staged`，但用量事件只记真正传输的那个文件。
-- 单元用例：只复检有指纹的路径、无指纹时完全不探测、租约丢失时不探测、越界路径拒绝删除、move 模式删本地、mtime 偏差 0.5 秒不再算同一文件、回执载荷包含 `already_present_files`、请求模型校验该字段。
+- 单元用例：只复检有指纹的路径、无指纹时完全不探测、租约丢失时不探测、越界路径拒绝删除、move 模式删本地、mtime 偏差 0.5 秒不再算同一文件、回执载荷包含 `already_present_files`、心跳透传该字段、请求模型校验该字段且拒绝非子集输入、`run_uploader` 接线（move 语义 + 回执汇总）。
 - `tests/test_worker.py` 增加 autouse fixture，把 `skip_already_uploaded_files` 置为直通，避免新增的 lsjson 复核打乱这些用例对 rclone 调用序列的断言；复核逻辑本身由上面的真 rclone 用例覆盖。
-- 全量：**352 passed, 0 skipped, 4 warnings**（真 MySQL 8.4.8 + 真实 rclone v1.65.0）；非 root 同为 352 passed。
+- 全量：**356 passed, 0 skipped, 4 warnings**（真 MySQL 8.4.8 + 真实 rclone v1.65.0）；非 root 同为 356 passed。
 
 ## 残留
 

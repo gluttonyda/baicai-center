@@ -68,7 +68,7 @@ def test_run_uploader_reports_not_found_when_no_local_files():
         worker.run_uploader("baicai_1@1", ["missing/file.mkv"], "move")
 
     mock_report_status.assert_called_once_with(
-        "baicai_1@1", "not_found", [], ["missing/file.mkv"]
+        "baicai_1@1", "not_found", [], ["missing/file.mkv"], already_present_files=[]
     )
 
 
@@ -78,7 +78,7 @@ def test_run_uploader_ignores_clfstmp_files():
 
     mock_resolve_task_path.assert_not_called()
     mock_report_status.assert_called_once_with(
-        "baicai_1@1", "not_found", [], ["movie/downloading.CLFSTMP"]
+        "baicai_1@1", "not_found", [], ["movie/downloading.CLFSTMP"], already_present_files=[]
     )
 
 
@@ -92,6 +92,7 @@ def test_run_uploader_ignores_clfstmp_progress_files():
         "not_found",
         [],
         ["movie/downloading.mkv.clfstmp.progress"],
+        already_present_files=[],
     )
 
 
@@ -999,6 +1000,7 @@ def test_run_uploader_reports_remote_partial_success_with_remaining_missing_file
         "not_found",
         ["movie/already-moved.mkv"],
         ["movie/still-missing.mkv"],
+        already_present_files=["movie/already-moved.mkv"],
     )
 
 
@@ -1020,7 +1022,7 @@ def test_run_uploader_rejects_local_file_changed_after_dispatch():
 
     mock_popen.assert_not_called()
     mock_report_status.assert_called_once_with(
-        "baicai_1@1", "not_found", [], ["movie/a.mkv"]
+        "baicai_1@1", "not_found", [], ["movie/a.mkv"], already_present_files=[]
     )
 
 
@@ -2044,3 +2046,44 @@ def test_report_status_payload_includes_already_present_files():
     payload = post.call_args.args[0]
     assert payload["already_present_files"] == ["movie/b.mkv"]
     assert payload["successful_files"] == ["movie/a.mkv"]
+
+
+def test_report_heartbeat_forwards_already_present_files():
+    """心跳也要带上已存在清单：Center 对 uploading 状态同样会结算 successful_files。"""
+    with patch("worker.report_status") as mock_report:
+        assert worker.report_heartbeat("baicai_1@1", ["movie/a.mkv"], ["movie/a.mkv"]) is True
+
+    mock_report.assert_called_once_with(
+        "baicai_1@1",
+        "uploading",
+        ["movie/a.mkv"],
+        already_present_files=["movie/a.mkv"],
+    )
+
+
+def test_run_uploader_wires_move_delete_and_reports_already_present(monkeypatch, tmp_path):
+    """接线验证：run_uploader 要把 move 语义与已存在清单真正传到助手与回执里。
+
+    （其余单元用例把 skip 助手整体置为直通，这条专门覆盖接线。）
+    """
+    monkeypatch.setattr(worker, "skip_already_uploaded_files", _REAL_SKIP_ALREADY_UPLOADED)
+    base = tmp_path / "src"
+    base.mkdir()
+    target = base / "movie.mkv"
+    target.write_text("data", encoding="utf-8")
+
+    with patch("worker.ALLOWED_BASE_DIRS", [str(base)]), patch(
+        "worker.resolve_task_path", return_value=(str(base), "movie.mkv")
+    ), patch("worker.detect_remote_existing_files", return_value={"movie.mkv"}), patch(
+        "worker.report_status"
+    ) as mock_report:
+        worker.run_uploader("baicai_1@1", ["movie.mkv"], "move")
+
+    mock_report.assert_called_once_with(
+        "baicai_1@1",
+        "completed",
+        ["movie.mkv"],
+        [],
+        already_present_files=["movie.mkv"],
+    )
+    assert not target.exists()
