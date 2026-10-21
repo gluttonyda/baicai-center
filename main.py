@@ -863,8 +863,10 @@ def resolve_successful_task_ids(
     """
     if not file_paths:
         return []
-    normalized_paths = list(dict.fromkeys(normalize_relative_path(path) for path in file_paths))
-    exact_placeholders = ",".join(["%s"] * len(file_paths))
+    # 先去重：同一批回报里重复出现的路径只能认领一行，否则第二条会走归一化兜底把另一行也选中。
+    unique_paths = list(dict.fromkeys(file_paths))
+    normalized_paths = list(dict.fromkeys(normalize_relative_path(path) for path in unique_paths))
+    exact_placeholders = ",".join(["%s"] * len(unique_paths))
     normalized_placeholders = ",".join(["%s"] * len(normalized_paths))
     task_condition, task_params = _task_dispatch_condition(dispatch_id)
     cursor.execute(
@@ -876,7 +878,7 @@ def resolve_successful_task_ids(
           AND (file_path IN ({exact_placeholders})
                OR {_normalized_path_expression("file_path")} IN ({normalized_placeholders}))
         """,
-        [account_name] + task_params + list(file_paths) + normalized_paths,
+        [account_name] + task_params + unique_paths + normalized_paths,
     )
     rows = cursor.fetchall() or []
     candidates: dict[str, list[dict]] = {}
@@ -884,7 +886,7 @@ def resolve_successful_task_ids(
         candidates.setdefault(normalize_relative_path(row["file_path"]), []).append(row)
 
     chosen_ids: List[int] = []
-    for reported_path in file_paths:
+    for reported_path in unique_paths:
         bucket = candidates.get(normalize_relative_path(reported_path))
         if not bucket:
             continue

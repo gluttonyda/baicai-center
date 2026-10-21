@@ -833,3 +833,36 @@ def test_mark_successful_uploads_does_not_resurrect_not_found_rows(schema_db):
 
     assert status == "not_found"
     assert events == 0
+
+
+def test_mark_successful_uploads_dedupes_repeated_paths(schema_db):
+    """同一批回报里重复出现的路径只能认领一行，不能因此把归一化相同的另一行也标成功。"""
+    with schema_db.cursor() as cursor:
+        cursor.execute(
+            "INSERT INTO worker_registry (node_name, api_url, protocol_version, last_active) "
+            "VALUES ('worker-node-1', 'http://worker-node-1:8001/task/upload', 2, UTC_TIMESTAMP())"
+        )
+        cursor.execute(
+            "INSERT INTO drive_accounts (account_name, role, is_active) VALUES ('baicai_1@1', 'uploader', 1)"
+        )
+        for path in ("movie/z.mkv", "/movie/z.mkv"):
+            cursor.execute(
+                "INSERT INTO file_tasks (file_path, status, worker_node, account_used, size_bytes, dispatch_id) "
+                "VALUES (%s, 'uploading', 'worker-node-1', 'baicai_1@1', 10, NULL)",
+                (path,),
+            )
+
+    with schema_db.cursor() as cursor:
+        main.mark_successful_uploads_by_files(
+            cursor, "baicai_1@1", "staged", ["movie/z.mkv", "movie/z.mkv"], None
+        )
+
+    with schema_db.cursor() as cursor:
+        cursor.execute("SELECT file_path, status FROM file_tasks ORDER BY file_path")
+        statuses = {row["file_path"]: row["status"] for row in cursor.fetchall()}
+        cursor.execute("SELECT COUNT(*) AS events FROM account_upload_events")
+        events = cursor.fetchone()["events"]
+
+    assert statuses["movie/z.mkv"] == "staged"
+    assert statuses["/movie/z.mkv"] == "uploading"
+    assert events == 1
