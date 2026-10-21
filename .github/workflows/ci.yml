@@ -20,10 +20,6 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.10", "3.11"]
-    # Worker journal 默认写 /opt/baicai-worker（仅 root 可创建），GitHub 托管 runner 是非 root，
-    # 不覆盖就会 PermissionError。Scanner 缓存路径由用例自行 patch，这里不需要设置。
-    env:
-      TASK_JOURNAL_DB_PATH: ${{ runner.temp }}/baicai-ci/task_journal.db
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # pinned: releases-v4 head
 
@@ -58,14 +54,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt -r requirements-dev.txt
 
+      # Worker journal 默认写 /opt/baicai-worker（仅 root 可创建），托管 runner 是非 root，
+      # 不覆盖会 PermissionError。Scanner 缓存由用例自行 patch，无需设置。
       - name: Run test suite
         env:
           PYTHONPATH: .:baicai-work
+          TASK_JOURNAL_DB_PATH: ${{ runner.temp }}/baicai-ci/task_journal.db
         run: python -m pytest tests -q -ra
 
       - name: Require rclone integration tests to run
         env:
           PYTHONPATH: .:baicai-work
+          TASK_JOURNAL_DB_PATH: ${{ runner.temp }}/baicai-ci/task_journal.db
         run: |
           set -o pipefail
           status=0
