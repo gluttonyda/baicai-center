@@ -4,20 +4,13 @@
 
 ## 2026-10-21 uploader 改用 raw 清单（Issue #2）
 
-- uploader 的 `rclone copy`/`rclone move`，以及 `move` 任务本地缺失时的远端复核（`lsf`/`lsjson`），由 `--files-from` 改为 `--files-from-raw`。相对路径以 `#`、`;` 开头的文件不再被当作注释静默跳过；带首尾空白的路径不再被裁剪，也不会因此误搬同目录中裁剪后同名的未列入任务的文件。
-- 成功回报改用 `parse_rclone_transfer_line` 解析：路径取 `INFO  : ` 之后、行尾 `: <动作>` 之前的全部内容，不再丢失前导空白，也不会在路径含 `: Copied` 时被截断。
-- `lsjson` 远端指纹复核兼容 rclone 固定 9 位小数秒的 `ModTime`。此前在 Python 3.10 上解析失败，复核一律不命中（Worker 镜像为 3.11）。
-- 升级提示：需要 rclone 1.52 或更高版本，与 cleaner 相同。升级后新派发的这类文件会真正上传，`move` 来源中的会被搬走；升级前已被整批回报 `completed` 的这类任务在 Center 中已是成功状态，但文件从未上传，不会自动补传，需要人工排查。
-- 在隔离测试容器（Python 3.10、MySQL 8.4.8、rclone v1.65.0-DEV）中执行全量测试：**305 passed**，非 root 运行同为 305 passed。行为细节、兼容影响和残留风险见 [2026-10-21 uploader 改用 raw 清单说明](docs/CODE_CHANGES_20261021_uploader_raw.md)。
-
-## 2026-10-21 uploader 清单改 raw（Issue #2）
-
-- uploader 与远端复核改用 `--files-from-raw`：`#`、`;` 开头和首尾带空白的文件名不再被静默跳过；需要 rclone ≥1.52。
-- 成功回报改用 `parse_rclone_transfer_line`，修复路径前导空格被吞、含 `: Copied` 的路径被截断；补上 `Moved` 动作。
-- 新增控制字符（Tab 等）路径拒绝：这类名字 rclone 会转义，以前会静默判成功。
-- 上传结束时对「无成功也无缺失记录」的文件打 warning。
-- 升级影响：以前被跳过、库里却标记为成功的文件不会自动补传，需要人工核对（见 Issue #7）。
-- `lsjson` 的 `ModTime` 9 位小数秒在 Python 3.10 上无法解析，已兼容。
+- uploader 的 `rclone copy`/`rclone move`、`move` 任务本地缺失时的远端复核，以及无调用方的 `detect_cleaner_dest_existing_files`，全部由 `--files-from` 改为 `--files-from-raw`。以 `#`、`;` 开头的相对路径不再被当注释跳过；带首尾空白的路径不再被裁剪，也不会误搬同目录中裁剪后同名的、未列入任务的文件。
+- 成功回报改用 `parse_rclone_transfer_line`：取 `INFO  : ` 之后、行尾 `: <动作>` 之前的全部内容，不再丢失前导空白，也不会在路径含 `: Copied` 时被截断；动作集合补上 `Moved`。
+- 含控制字符（Tab、``、``）的路径**逐文件**回执 `not_found` 并记 warning：rclone 会把这类字符转义成符号（Tab→`␉`），按原名无法搬运。不整批拒绝，避免 Center 每 60 秒重派同一批而卡死账号组。
+- 一次上传结束时，若确实解析到逐文件日志、且仍有文件既无成功也无缺失记录，打 warning 提示可能漏搬；目标端已存在（`There was nothing to transfer`）属于正常，不会误报。
+- `lsjson` 远端指纹复核兼容 rclone 固定 9 位小数秒的 `ModTime`：此前在 Python 3.10 上解析失败，复核一律不命中（Worker 镜像为 3.11）。
+- 升级提示：需要 rclone 1.52 或更高版本，与 cleaner 相同。升级前已被整批回报 `completed` 但从未上传的文件不会自动补传，需要人工排查（Center 整批标成功的问题见 Issue #7）。
+- 在隔离测试容器（Python 3.10、MySQL 8.4.8、rclone v1.65.0-DEV）中执行全量测试：**311 passed**，非 root 同为 311 passed。细节见 [uploader raw 清单说明](docs/CODE_CHANGES_20261021_uploader_raw.md)。
 
 ## 2026-10-21 派发地址白名单（Issue #1）
 

@@ -161,11 +161,7 @@ class TaskPayload(BaseModel):
         for file_path in value:
             if file_path == "":
                 raise ValueError("files 中不能存在空路径")
-            # rclone 的 local backend 会把 Tab 等控制字符转义成符号（Tab→U+2409），
-            # 清单里写真实控制字符时文件不会被搬运也不会有日志，因此明确拒绝而不是静默成功。
-            if any(char in file_path for char in ("\x00", "\r", "\n")) or any(
-                ord(char) < 32 or ord(char) == 127 for char in file_path
-            ) or len(file_path) > 1024:
+            if any(char in file_path for char in ("\x00", "\r", "\n")) or len(file_path) > 1024:
                 raise ValueError("files 中存在非法路径")
             normalized_files.append(file_path)
         return normalized_files
@@ -435,6 +431,11 @@ def is_quota_error(line: str) -> bool:
 RCLONE_TRANSFER_LOG_PATTERN = re.compile(
     r"INFO\s*: (.*): (Copied(?: \([^)]*\))?|Moved(?: \([^)]*\))?|Skipped|Deleted)$"
 )
+
+
+def has_unsendable_characters(file_path: str) -> bool:
+    """rclone 的 local backend 会把 C0/DEL 转义成可见符号（Tab→U+2409），原样清单匹配不到。"""
+    return any(ord(char) < 32 or ord(char) == 127 for char in file_path)
 
 
 def parse_rclone_transfer_line(line: str) -> Optional[tuple[str, str]]:
@@ -736,7 +737,7 @@ def detect_cleaner_dest_existing_files(
                 "rclone",
                 "lsf",
                 f"{dest_name}:{target_remote_dir}",
-                "--files-from",
+                "--files-from-raw",
                 files_from_path,
                 "--files-only",
                 "--recursive",
@@ -880,6 +881,15 @@ def run_uploader(
         if resolved is None:
             missing_files.append(file_path)
             continue
+        if has_unsendable_characters(file_path):
+            # 不整批拒绝：否则 Center 每 60 秒重派同一批并再次 422，账号组会永远卡住。
+            logger.warning(
+                "⚠️ 账号 [%s] 跳过含控制字符的路径（rclone 会转义字符，无法按原名搬运）：%r",
+                account_name,
+                file_path,
+            )
+            missing_files.append(file_path)
+            continue
         base_dir, clean_path = resolved
         expected_size = (
             expected_sizes[file_index]
@@ -924,6 +934,7 @@ def run_uploader(
     final_status = "completed"
     successful_files = []
     successful_files_seen: set[str] = set()
+    parsed_transfer_lines = 0
     def mark_success(file_path: str) -> None:
         normalized = file_path.replace("\\", "/")
         if normalized not in successful_files_seen:
@@ -1053,6 +1064,7 @@ def run_uploader(
 
                             transfer = parse_rclone_transfer_line(line)
                             if transfer is not None:
+                                parsed_transfer_lines += 1
                                 file_path, action = transfer
                                 if action == "Skipped":
                                     logger.warning("⏭️ [%s] 远端已存在或被 rclone 跳过: %s", account_name, file_path)
@@ -1105,13 +1117,22 @@ def run_uploader(
     if final_status == "lease_lost":
         return
 
-    # rclone 退出码 0 不代表每个文件都搬成功（Moved 变体、编码转义、日志格式漂移都可能漏记）。
-    if final_status not in ("403_quota", "credential_invalid"):
-        requested_paths = {fp for files in tasks_by_dir.values() for fp in files}
-        unaccounted = sorted(requested_paths - set(successful_files) - set(missing_files))
+    # 只有确实出现过逐文件日志、且最终状态正常时才比较差集：
+    # 目标端已存在时 rclone 只输出 "There was nothing to transfer"，此时差集为整批，属正常。
+    if final_status == "completed" and parsed_transfer_lines > 0:
+        missing_set = set(missing_files)
+        unaccounted = sorted(
+            f"{base_dir}/{path}"
+            for base_dir, files in tasks_by_dir.items()
+            for path in files
+            if path not in successful_files_seen
+            and f"{base_dir}/{path}" not in successful_files_seen
+            and path not in missing_set
+            and f"{base_dir}/{path}" not in missing_set
+        )
         if unaccounted:
             logger.warning(
-                "⚠️ [%s] %s 个文件既没有成功记录也没有缺失记录，可能未被搬运（rclone 退出码 0）：%s",
+                "⚠️ [%s] %s 个文件既没有成功记录也没有缺失记录，可能未被搬运：%s",
                 account_name,
                 len(unaccounted),
                 ", ".join(unaccounted[:5]) + (" ..." if len(unaccounted) > 5 else ""),

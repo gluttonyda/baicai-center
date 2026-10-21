@@ -45,14 +45,20 @@ INFO  : movie/name: Copied tricky.txt: Copied (new)
 ### 清单与路径
 
 - 路径仍由 `resolve_task_path` 生成：拒绝 NUL、CR、LF；去掉前导 `/` 后执行 `normpath`；拒绝 `..` 越界；按 `realpath` 核对 `ALLOWED_BASE_DIRS` 和来源根目录。不做 `strip`，也不改名。
-- **新增拒绝控制字符**（Tab、`\x07`、`\x7f` 等）：rclone 的 local backend 会把控制字符转义成符号（Tab→`␉` U+2409），清单里写真实 Tab 时目标端文件名被改写、甚至完全搬不动，而 rclone 仍返回 0。这类路径以前会被静默判为成功，现在由 `TaskPayload` 直接拒绝（422），不会进入搬运流程。
+- **含控制字符的路径逐文件回执 `not_found`**（Tab、`\x07`、`\x7f` 等）：rclone 的 local backend 会把控制字符转义成符号（Tab→`␉` U+2409），清单里写真实 Tab 时目标端文件名被改写、甚至完全搬不动，而 rclone 仍返回 0。
+  - 处理方式是**跳过单个文件 + 记 warning + 计入 `missing_files`**，而不是拒绝整个 payload。原因：`TaskPayload` 若整批返回 422，Center 会把整批任务打回 `pending` 并释放锁，下一个 60 秒周期又取到同一批、再次 422，该账号组会永久卡住（这是审查阶段发现的可用性回退，已修）。
+  - 取舍说明：这类文件用转义后的名字作为清单项其实可以上传成功（但目标端文件名会被改写），本轮选择"拒绝并显式回执"而不是"自动改名上传"，避免 Center 记录的路径与实际文件不一致。
 - `--files-from-raw` 不做 glob：`glob*star.txt`、`br[ack]et.txt` 这类名字按字面搬运。旧 `--files-from` 内部同样走精确匹配（不展开 glob），所以这里没有语义损失，集成用例已锁定该行为。
 - 清单写入的是相对来源根目录的路径；远端复核时则是相对 `<账号>:<目标目录>` 的路径。两者的相对路径相同。
 - `--files-from-raw` 逐行原样匹配，只去掉行尾换行（rclone 按行读取并去掉行尾 `\r`），不做 glob。首尾空白、`#`/`;` 开头都算文件名的一部分。之所以继续拒绝 CR/LF，是因为它们会破坏“一行一个路径”。
 
 ### 未记录文件告警
 
-一次 `run_uploader` 结束时，会对比「本次清单」与「已成功 + 已缺失」的差集。若某文件既没有成功记录也没有缺失记录（例如 rclone 输出了未识别的动作、路径被后端转义、或日志格式变化），会打一条 warning 并列出前 5 个路径。这是可观测性补丁，不改变回报状态；Center 侧「整批标成功」的问题单独跟踪（Issue #7）。
+一次 `run_uploader` 结束时，在**确实解析到逐文件日志**（`parsed_transfer_lines > 0`）且最终状态为 `completed` 的前提下，对比「本次清单」与「已成功 + 已缺失」的差集；若仍有文件既无成功也无缺失记录，打一条 warning 并列出前 5 个路径。
+
+- 为什么加这两个前提：目标端已存在同一批文件时，rclone 只输出 `There was nothing to transfer`，没有任何 `<路径>: Copied/Skipped` 行；如果无条件比较差集，会把这批文件全部误报为"可能未被搬运"（重派已搬过的批次时很常见）。
+- 失败状态（`403_quota`、`credential_invalid`、`failed`）不打印该告警：状态本身已经表达了结果，再叠加一条"可能未被搬运"只会制造噪音。
+- 这是可观测性补丁，不改变回报状态；Center 侧「整批标成功」的问题单独跟踪（Issue #7）。
 
 ### 成功回报
 
@@ -130,11 +136,11 @@ PYTHONPATH=.:baicai-work pytest -q tests/test_worker_integration.py tests/test_w
 
 ## 残留风险
 
-1. **日志格式依赖。** 解析依赖 rclone 文本日志中 `INFO  : <路径>: <动作>` 的格式，本轮只在 v1.65.0-DEV 上实测。CI 安装的是 `rclone-current`，会在新版本上跑同一组集成用例。如果将来格式变化，导致解析不到或解析出的路径与任务对不上，这些文件不会被记为成功：部分失败时，`copy` 任务会回退重传，`move` 任务会靠远端复核补偿。但如果最终状态是 `completed`，Center 会整批标为成功，不看 `successful_files`。
+1. **日志格式依赖（含冒号后空白）。** 解析依赖 rclone 文本日志中 `INFO  : <路径>: <动作>` 的格式，其中 `INFO` 与冒号之间允许任意多空格、冒号后严格一个空格；本轮只在 v1.65.0-DEV 上实测。如果 rclone 调整 padding 或用 `--log-format` 改变分隔，路径会带入多余空格导致 `mark_success` 失配（此时至少还有上面的 warning 兜底）。CI 安装的是 `rclone-current`，会在新版本上跑同一组集成用例。如果将来格式变化，导致解析不到或解析出的路径与任务对不上，这些文件不会被记为成功：部分失败时，`copy` 任务会回退重传，`move` 任务会靠远端复核补偿。但如果最终状态是 `completed`，Center 会整批标为成功，不看 `successful_files`。
 2. **`Copied (…) to: <新名>`。** 目标名与源名不同时（例如 `--name-transform` 或大小写转换），rclone 会在动作后追加 `to: <新名>`，这种行不会被匹配。uploader 目前不会产生这种情况。
 3. **文件名触发错误判断（原有问题，本轮未改）。** `is_quota_error` 和 `is_credential_invalid_error` 对每一整行做子串匹配，包括 `Copied` 成功行。文件名中如果含有 `upload limit`、`quota exceeded`、`token expired`、`config reconnect` 等字样，会被误判为 `403_quota` 或 `credential_invalid`（后者会停用账号）。建议后续只对非成功行做这两种判断。
 4. **反斜杠（原有问题，本轮未改）。** `mark_success` 会把路径中的 `\` 替换为 `/`。Linux 和 Google Drive 的文件名都可以含 `\`，这类文件回报的路径会与原始路径不一致。
 5. **回报的是规范化后的路径（原有行为）。** Center 下发的路径如果带前导 `/`、`./` 或 `//`，回报的是 `normpath` 之后的路径。
 6. **整批成功（原有行为）。** 清单中的文件如果在 Worker 检查之后、rclone 执行之前被删除，rclone 对清单中不存在的源文件不报错（这一点依据 rclone 源码，未实测），Worker 回报 `completed`，Center 会把它和其他文件一起标为成功。
 7. **未在真实 Google Drive 上验证。** 集成用例使用 alias 指向本地目录。根据 rclone 文档，Drive 后端的默认编码只处理非法 UTF-8，不转义首尾空格和 `#`、`;`，这一点没有实测。
-8. `detect_cleaner_dest_existing_files` 仍然使用 `--files-from`。它目前没有调用方，见上文。
+8. `detect_cleaner_dest_existing_files` 已改为 raw，但它仍无任何调用方，属于候选删除项。

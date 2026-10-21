@@ -1520,33 +1520,29 @@ def test_parse_rclone_transfer_line_recognizes_moved_without_suffix():
 
 
 @pytest.mark.parametrize("file_path", ["tab\there.txt", "ctrl\x07char.txt", "del\x7fchar.txt"])
-def test_task_payload_rejects_control_characters_in_files(file_path):
-    """rclone 会转义控制字符，清单写了也搬不动，应在入口拒绝而不是静默成功。"""
-    with pytest.raises(ValueError):
-        worker.TaskPayload(
-            worker_node=worker.WORKER_NODE_NAME,
-            account_name="baicai_1@1",
-            files=[file_path],
-        )
+def test_task_payload_accepts_control_characters_per_file(file_path):
+    """控制字符不再整批拒绝：否则 Center 重派同一批会反复 422，账号组卡死。"""
+    payload = worker.TaskPayload(
+        worker_node=worker.WORKER_NODE_NAME,
+        account_name="baicai_1@1",
+        files=[file_path],
+    )
+
+    assert payload.files == [file_path]
 
 
-def test_run_uploader_warns_about_files_without_transfer_record(caplog):
-    """rclone 退出码 0 但清单里某文件没有任何成功/缺失记录时，必须留下可观测的告警。"""
-    import logging
-
+def _fake_rclone_harness(lines, returncode=0):
     class FakeStdout:
-        def __init__(self, lines):
-            self._lines = list(lines)
+        def __init__(self, items):
+            self._items = list(items)
 
         def readline(self):
-            if self._lines:
-                return self._lines.pop(0)
-            return ""
+            return self._items.pop(0) if self._items else ""
 
     class FakeProcess:
-        def __init__(self, lines):
+        def __init__(self):
             self.stdout = FakeStdout(lines)
-            self.returncode = 0
+            self.returncode = returncode
 
         def poll(self):
             return self.returncode
@@ -1564,8 +1560,6 @@ def test_run_uploader_warns_about_files_without_transfer_record(caplog):
             return False
 
     class FakeSelector:
-        """真实 selector 在 unregister 后不会再返回该 fd；这里同样要遵守，否则外层会空转。"""
-
         def __init__(self, process):
             self.process = process
             self.registered = True
@@ -1587,12 +1581,49 @@ def test_run_uploader_warns_about_files_without_transfer_record(caplog):
         def close(self):
             return None
 
-    process = FakeProcess(["2026/10/21 10:00:00 INFO  : movie/a.mkv: Copied (new)\n"])
+    return FakeProcess(), FakeSelector
+
+
+def test_run_uploader_skips_control_character_paths_per_file(caplog):
+    """含 Tab 的路径应逐文件回执 not_found，同批其他文件照常上传。"""
+    import logging
+
+    process, selector_factory = _fake_rclone_harness(
+        ["2026/10/21 10:00:00 INFO  : movie/a.mkv: Copied (new)\n"]
+    )
+
+    with patch("worker.resolve_task_path", side_effect=[("/dir1", "movie/a.mkv"), ("/dir1", "bad\ttab.mkv")]), \
+         patch("worker.ALLOWED_BASE_DIRS", ["/dir1"]), \
+         patch("worker.subprocess.Popen", return_value=process), \
+         patch("worker.selectors.DefaultSelector", return_value=selector_factory(process)), \
+         patch("worker.tempfile.mkstemp", return_value=(1, "/tmp/a.txt")), \
+         patch("worker.os.fdopen") as mock_fdopen, \
+         patch("worker.os.path.exists", return_value=True), \
+         patch("worker.os.remove"), \
+         patch("worker.report_status") as mock_report_status:
+        mock_fdopen.return_value.__enter__.return_value = MagicMock()
+        with caplog.at_level(logging.WARNING):
+            worker.run_uploader("baicai_1@1", ["movie/a.mkv", "bad\ttab.mkv"], "copy")
+
+    status, final_status, successful, missing = mock_report_status.call_args.args
+    assert final_status == "completed"
+    assert successful == ["movie/a.mkv"]
+    assert missing == ["bad\ttab.mkv"]
+    assert any("控制字符" in record.getMessage() for record in caplog.records)
+
+
+def test_run_uploader_does_not_warn_when_rclone_reports_nothing_to_transfer(caplog):
+    """目标端已存在时 rclone 只输出 There was nothing to transfer，不能误报"可能未被搬运"。"""
+    import logging
+
+    process, selector_factory = _fake_rclone_harness(
+        ["2026/10/21 10:00:00 INFO  : There was nothing to transfer\n"]
+    )
 
     with patch("worker.resolve_task_path", side_effect=[("/dir1", "movie/a.mkv"), ("/dir1", "movie/b.mkv")]), \
          patch("worker.ALLOWED_BASE_DIRS", ["/dir1"]), \
          patch("worker.subprocess.Popen", return_value=process), \
-         patch("worker.selectors.DefaultSelector", return_value=FakeSelector(process)), \
+         patch("worker.selectors.DefaultSelector", return_value=selector_factory(process)), \
          patch("worker.tempfile.mkstemp", return_value=(1, "/tmp/a.txt")), \
          patch("worker.os.fdopen") as mock_fdopen, \
          patch("worker.os.path.exists", return_value=True), \
@@ -1602,7 +1633,4 @@ def test_run_uploader_warns_about_files_without_transfer_record(caplog):
         with caplog.at_level(logging.WARNING):
             worker.run_uploader("baicai_1@1", ["movie/a.mkv", "movie/b.mkv"], "copy")
 
-    assert any(
-        record.levelno == logging.WARNING and "movie/b.mkv" in record.getMessage()
-        for record in caplog.records
-    )
+    assert not any("既没有成功记录" in record.getMessage() for record in caplog.records)
