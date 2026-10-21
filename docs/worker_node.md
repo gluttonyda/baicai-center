@@ -50,6 +50,8 @@ Center 调用这个接口派发任务。
 
 接口默认验证节点 HMAC；本节点的 `NODE_TOKEN` 必须与 Center 的 `WORKER_TOKEN_MAP[WORKER_NODE_NAME]` 一致。重复 `dispatch_id` 只接纳相同内容，不会重复启动 rclone。
 
+`account_name` 和 `dest_name` 会拼成 rclone 参数 `<名称>:<目录>`，因此只接受 `[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}`，例如 `baicai_1@1`、`baicai-1@1-3`、`baicai-big2`。以 `-` 开头（会被当作选项）、包含冒号或逗号（连接串及后端参数）、路径分隔符、空白或控制符的名称会被 422 拒绝，并且不再去除首尾空白。签名、节点名和 Bearer 均按 UTF-8 字节常量时间比较，非 ASCII 输入返回 401，不会导致 500。
+
 ## Scanner
 
 Scanner 默认扫描三个根目录：
@@ -79,7 +81,7 @@ CACHE_DB_PATH
 
 Uploader 任务会调用 `rclone copy` 或 `rclone move`。
 
-Cleaner 任务会调用 `rclone move`，把中转盘文件移动到最终目标盘。
+Cleaner 任务会调用 `rclone move --files-from-raw <本批清单>`，只把本次 dispatch 的文件从中转盘移动到最终目标盘。中转目录里不在清单中的文件保持不动。清单路径与上传时的远端相对路径规则一致：去掉前导 `/` 后执行 `normpath`，拒绝 `..` 越界路径。`--files-from-raw` 需要 rclone 1.52 或更高版本。`--drive-use-trash=false` 只影响服务端搬运后源端副本的删除方式（不进回收站），不会删除最终目标盘上的文件。
 
 上传命令保留：
 
@@ -122,7 +124,6 @@ cp .env.example .env
 至少填写：
 
 ```text
-API_TOKEN
 NODE_TOKEN
 CENTER_URL
 CENTER_API
@@ -132,7 +133,7 @@ TARGET_REMOTE_DIR
 ALLOWED_BASE_DIRS
 ```
 
-`API_TOKEN` 仍为必填兼容配置；协议 v2 节点通信默认使用 HMAC。保持 `ALLOW_LEGACY_BEARER_AUTH=false`、`SCANNER_SEND_BEARER_AUTH=false`，并同步各节点时钟。
+协议 v2 节点通信默认使用 HMAC。保持 `ALLOW_LEGACY_BEARER_AUTH=false`、`SCANNER_SEND_BEARER_AUTH=false`，并同步各节点时钟；此时可以不配置 `API_TOKEN`。只有 Worker 开启 `ALLOW_LEGACY_BEARER_AUTH=true` 或 Scanner 开启 `SCANNER_SEND_BEARER_AUTH=true` 时，才必须配置与 Center 一致的非空 `API_TOKEN`，否则进程启动失败。
 
 确认宿主机有可用 rclone 配置：
 
@@ -207,7 +208,7 @@ Worker 会回报：
 
 - Worker 不需要部署 `main.py`
 - Worker 不需要直接访问 MySQL
-- Worker 的 `NODE_TOKEN` 必须匹配 Center 对应节点的 `WORKER_TOKEN_MAP`；启用旧版兼容时 `API_TOKEN` 也必须一致
+- Worker 的 `NODE_TOKEN` 必须匹配 Center 对应节点的 `WORKER_TOKEN_MAP`；启用旧版兼容时 `API_TOKEN` 也必须配置且与 Center 一致
 - `WORKER_NODE_NAME` 必须和 Center 的 `WORKER_API_URL_MAP` 匹配
 - `WORKER_API_URL` 必须是 Center 能访问到的地址
 - 不要把真实 `.env` 或 `rclone.conf` 提交到公开仓库

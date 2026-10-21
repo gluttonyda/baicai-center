@@ -118,13 +118,15 @@ docker compose up -d --build
 curl --fail http://127.0.0.1:8080/health/ready
 ```
 
-`/health/ready` 同时检查数据库与协议 v2 必要字段；根路径 `/` 仅表示 API 进程可响应。旧库需按 [Center 节点说明](center_node.md#数据库初始化) 依次执行拆分锁、上传统计和派发协议迁移。
+`/health/ready` 同时检查数据库、协议 v2 必要字段，以及 `file_path_hash` 是否为 `SHA2(file_path, 256)` 的 `CHAR(64)` STORED 生成列、是否有完整唯一索引且没有前缀/表达式唯一索引；根路径 `/` 仅表示 API 进程可响应。旧库需按 [Center 节点说明](center_node.md#数据库初始化) 依次执行拆分锁、上传统计、派发协议和 `file_path_hash` 迁移。
 
 ### 运行测试
 
 ```bash
 PYTHONPATH=.:baicai-work pytest -q
 ```
+
+真实 MySQL 用例需要设置 `BAICAI_TEST_MYSQL_HOST`、`BAICAI_TEST_MYSQL_USER`、`BAICAI_TEST_MYSQL_PASSWORD`、`BAICAI_TEST_MYSQL_DATABASE`；未设置时会被跳过。说明见 [2026-10-21 调度互斥与鉴权加固说明](CODE_CHANGES_20261021.md#测试)。
 
 ### 清理 Worker 扫描缓存
 

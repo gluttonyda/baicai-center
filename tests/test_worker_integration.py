@@ -128,3 +128,44 @@ def test_worker_rclone_upload_and_clean_round_trip():
             assert dest_file.exists()
             assert not staged_file.exists()
             assert clean_reports[-1][:2] == ("baicai-1@1-3", "clean_success")
+
+
+def test_worker_rclone_clean_moves_only_requested_files():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        uploader_root = tmp_path / "uploader"
+        dest_root = tmp_path / "dest"
+        config_path = tmp_path / "rclone.conf"
+        staging_dir = uploader_root / worker.TARGET_REMOTE_DIR
+        dest_dir = dest_root / worker.TARGET_REMOTE_DIR
+        requested = ["movie/requested.mkv", "/电影/带 空格.mkv"]
+        unlisted = ["movie/unlisted-same-dir.mkv", "other/unlisted.mkv", "movie/#comment-like.mkv"]
+        for relative_path in ["movie/requested.mkv", "电影/带 空格.mkv", *unlisted]:
+            staged = staging_dir / relative_path
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            staged.write_text(relative_path, encoding="utf-8")
+        dest_root.mkdir()
+        write_rclone_config(config_path, uploader_root, dest_root)
+
+        clean_reports = []
+
+        def capture_clean(account, status, successful_files=None, missing_files=None):
+            clean_reports.append((account, status))
+
+        with patch.dict(os.environ, {"RCLONE_CONFIG": str(config_path)}, clear=False), patch(
+            "worker.resolve_cleaner_destination_remote",
+            return_value=f"baicai-big:{worker.TARGET_REMOTE_DIR}",
+        ), patch("worker.report_status", side_effect=capture_clean):
+            worker.run_cleaner(
+                "baicai-1@1-3",
+                "baicai-big",
+                [*requested, "movie/already-moved.mkv", "../escape.mkv"],
+            )
+
+        assert clean_reports == [("baicai-1@1-3", "clean_success")]
+        for relative_path in ["movie/requested.mkv", "电影/带 空格.mkv"]:
+            assert (dest_dir / relative_path).exists()
+            assert not (staging_dir / relative_path).exists()
+        for relative_path in unlisted:
+            assert (staging_dir / relative_path).exists()
+            assert not (dest_dir / relative_path).exists()

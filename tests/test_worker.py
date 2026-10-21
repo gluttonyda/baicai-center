@@ -203,19 +203,25 @@ def make_cleaner_process(lines=None, returncode=0):
     return process
 
 
-def test_run_cleaner_moves_entire_remote_and_reports_dispatch_success():
+def test_run_cleaner_moves_only_dispatch_files_and_reports_success():
     process = make_cleaner_process()
+    files_from_contents = []
+
+    def capture_popen(cmd, **_kwargs):
+        files_from_path = cmd[cmd.index("--files-from-raw") + 1]
+        files_from_contents.append(Path(files_from_path).read_text(encoding="utf-8"))
+        return process
 
     with patch(
         "worker.resolve_cleaner_destination_remote",
         return_value="baicai-1@1-3,team_drive=target-team:LongEmby-B",
-    ) as mock_resolve_destination, patch("worker.subprocess.Popen", return_value=process) as mock_popen, patch(
+    ) as mock_resolve_destination, patch("worker.subprocess.Popen", side_effect=capture_popen) as mock_popen, patch(
         "worker.report_status"
     ) as mock_report_status, patch("worker.time.time", return_value=0):
         worker.run_cleaner(
             "baicai-1@1-3",
             "baicai-big2",
-            ["movie/a.mkv", "movie/a.mkv", "movie/b.mkv"],
+            ["movie/a.mkv", "/movie/a.mkv", "movie/./b.mkv", " movie/c.mkv ", "../escape.mkv"],
             "LongEmby-B",
         )
 
@@ -226,6 +232,8 @@ def test_run_cleaner_moves_entire_remote_and_reports_dispatch_success():
         "baicai-1@1-3:LongEmby-B",
         "baicai-1@1-3,team_drive=target-team:LongEmby-B",
     ]
+    assert files_from_contents == ["movie/a.mkv\nmovie/b.mkv\n movie/c.mkv \n"]
+    assert not Path(cmd[cmd.index("--files-from-raw") + 1]).exists()
     assert "--ignore-existing" not in cmd
     assert "--drive-use-trash=false" in cmd
     assert "--files-from" not in cmd
@@ -1135,6 +1143,115 @@ def test_receive_task_rejects_expired_node_hmac():
         response = client.post("/task/upload", content=raw_body, headers=headers)
 
     assert response.status_code == 401
+
+
+@pytest.mark.parametrize(
+    "header_name, header_value",
+    [
+        ("X-Baicai-Node", "wörker-node-1"),
+        ("X-Baicai-Signature", "é" * 64),
+    ],
+)
+def test_receive_task_rejects_non_ascii_hmac_headers_with_401(header_name, header_value):
+    raw_body = b'{"account_name":"baicai_1@1","files":[]}'
+    timestamp = str(int(time.time()))
+    headers = {
+        "Content-Type": "application/json",
+        "X-Baicai-Node": worker.WORKER_NODE_NAME,
+        "X-Baicai-Timestamp": timestamp,
+        "X-Baicai-Signature": worker.make_node_signature(timestamp, raw_body),
+    }
+    headers[header_name] = header_value.encode("utf-8")
+
+    with patch("worker.ALLOW_LEGACY_BEARER_AUTH", False):
+        response = client.post("/task/upload", content=raw_body, headers=headers)
+
+    assert response.status_code == 401
+
+
+def test_receive_task_rejects_non_ascii_legacy_bearer_with_401():
+    with patch("worker.ALLOW_LEGACY_BEARER_AUTH", True):
+        response = client.post(
+            "/task/upload",
+            json={"account_name": "baicai_1@1", "files": []},
+            headers={"Authorization": "Bearer tést-token".encode("utf-8")},
+        )
+
+    assert response.status_code == 401
+
+
+DANGEROUS_REMOTE_NAMES = [
+    "--config=/tmp/attacker.conf",
+    "-vv",
+    "baicai_1@1:other-dir",
+    ":local:",
+    "baicai_1@1/../etc",
+    "baicai_1@1,team_drive=attacker",
+    "baicai_1@1\nother",
+    "baicai_1@1\x00",
+    "baicai_1@1\t",
+    "baicai 1@1",
+    "..",
+    "baicai\\1@1",
+]
+
+
+@pytest.mark.parametrize("account_name", ["baicai_1@1", "baicai-1@1-3", "baicai_big@2", "baicai_big2@10"])
+def test_task_payload_accepts_existing_account_names(account_name):
+    payload = worker.TaskPayload(account_name=account_name, files=[])
+
+    assert payload.account_name == account_name
+
+
+@pytest.mark.parametrize("account_name", DANGEROUS_REMOTE_NAMES)
+def test_task_payload_rejects_dangerous_account_name(account_name):
+    with pytest.raises(ValueError):
+        worker.TaskPayload(account_name=account_name, files=[])
+
+
+@pytest.mark.parametrize("dest_name", ["baicai-big2", "baicai-big", "baicai_big2@1"])
+def test_task_payload_accepts_existing_dest_names(dest_name):
+    payload = worker.TaskPayload(task_type="clean", account_name="baicai-1@1-3", dest_name=dest_name, files=[])
+
+    assert payload.dest_name == dest_name
+
+
+@pytest.mark.parametrize("dest_name", DANGEROUS_REMOTE_NAMES)
+def test_task_payload_rejects_dangerous_dest_name(dest_name):
+    with pytest.raises(ValueError):
+        worker.TaskPayload(task_type="clean", account_name="baicai-1@1-3", dest_name=dest_name, files=[])
+
+
+def test_receive_task_rejects_option_like_account_name_before_start():
+    with patch("worker.start_detached_task") as mock_start:
+        response = client.post(
+            "/task/upload",
+            json={"account_name": "--config=/tmp/attacker.conf", "files": ["movie/a.mkv"]},
+            headers={"Authorization": f"Bearer {worker.API_TOKEN}"},
+        )
+
+    assert response.status_code == 422
+    mock_start.assert_not_called()
+
+
+@pytest.mark.parametrize("authorization", ["Bearer ", "Bearer x"])
+def test_legacy_bearer_cannot_authenticate_with_empty_api_token(authorization):
+    with patch("worker.ALLOW_LEGACY_BEARER_AUTH", True), patch("worker.API_TOKEN", ""), patch(
+        "worker.start_detached_task"
+    ) as mock_start:
+        response = client.post(
+            "/task/upload",
+            json={"account_name": "baicai_1@1", "files": []},
+            headers={"Authorization": authorization},
+        )
+
+    assert response.status_code == 401
+    mock_start.assert_not_called()
+
+
+def test_task_payload_rejects_non_ascii_worker_node_as_validation_error():
+    with pytest.raises(ValueError):
+        worker.TaskPayload(account_name="baicai_1@1", worker_node="wörker-node-1", files=[])
 
 
 def test_receive_task_is_idempotent_by_dispatch_id():

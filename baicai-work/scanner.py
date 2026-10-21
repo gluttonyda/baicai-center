@@ -39,15 +39,16 @@ def _get_path_env(name: str, default: str) -> str:
 
 
 CENTER_API = require_env("CENTER_API")
-API_TOKEN = require_env("API_TOKEN")
-NODE_TOKEN = require_env("NODE_TOKEN")
-WORKER_NODE_NAME = require_env("WORKER_NODE_NAME")
-WORKER_API_URL = require_env("WORKER_API_URL")
 SCANNER_SEND_BEARER_AUTH = os.getenv("SCANNER_SEND_BEARER_AUTH", "false").strip().lower() in (
     "1",
     "true",
     "yes",
 )
+# 共享 API_TOKEN 只在附带 legacy Bearer 头时需要；HMAC-only 部署可以不配置。
+API_TOKEN = require_env("API_TOKEN") if SCANNER_SEND_BEARER_AUTH else os.getenv("API_TOKEN", "").strip()
+NODE_TOKEN = require_env("NODE_TOKEN")
+WORKER_NODE_NAME = require_env("WORKER_NODE_NAME")
+WORKER_API_URL = require_env("WORKER_API_URL")
 CACHE_DB_PATH = _get_path_env("CACHE_DB_PATH", "/opt/baicai-worker/scanner_cache.db")
 SCANNER_CHUNK_SIZE = _get_int_env("SCANNER_CHUNK_SIZE", 1000)
 LINKS_DELAY_HOURS = _get_int_env("LINKS_DELAY_HOURS", 48)
