@@ -2376,3 +2376,17 @@ def test_verify_dispatch_target_blocks_dns_resolving_to_cgnat_metadata(monkeypat
     )
     with pytest.raises(ValueError):
         main.verify_dispatch_target("http://metadata.internal:80/latest/meta-data/")
+
+
+@pytest.mark.parametrize(
+    "api_url",
+    [
+        "http://0.1.2.3:8001/task/upload",      # Linux 会把 0/8 路由到本机
+        "http://0.0.0.1:8001/task/upload",
+        "http://[fd00:ec2::254]/latest/meta-data/",  # AWS IMDS（IPv6）
+        "http://168.63.129.16/machine?id=1",    # Azure WireServer
+    ],
+)
+def test_verify_dispatch_target_blocks_more_cloud_metadata_endpoints(api_url):
+    with pytest.raises(ValueError):
+        main.verify_dispatch_target(api_url)

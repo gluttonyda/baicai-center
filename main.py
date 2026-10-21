@@ -189,11 +189,14 @@ if ALLOW_PRIVATE_WORKER_URLS and TRUST_SELF_REPORTED_WORKER_API_URL and not WORK
 _ALWAYS_BLOCKED_NETWORKS = tuple(
     ipaddress.ip_network(network)
     for network in (
+        "0.0.0.0/8",       # Linux 会把到 0/8 的连接路由到本机，等价回环（除 0.0.0.0 外的地址也要拦）
         "100.64.0.0/10",   # CGNAT / 共享地址空间（含阿里云元数据 100.100.100.200）
         "192.0.0.0/24",    # IETF 协议分配（含部分云厂商元数据）
         "198.18.0.0/15",   # 基准测试保留段
         "240.0.0.0/4",     # 保留
+        "168.63.129.16/32",  # Azure WireServer / 平台虚拟 IP
         "255.255.255.255/32",
+        "fd00:ec2::/32",   # AWS IMDS 的 IPv6 地址 fd00:ec2::254（169.254.169.254 的 IPv6 对应物）
         "100::/64",        # IPv6 丢弃段
         "2001:db8::/32",   # 文档用段
     )
