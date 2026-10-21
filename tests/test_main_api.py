@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import threading
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -89,21 +90,98 @@ def test_report_status_preserves_leading_and_trailing_spaces():
     assert request.missing_files == [" missing.mkv "]
 
 
-def test_health_ready_queries_database_and_closes_connection():
+VALID_FILE_PATH_HASH_COLUMN = {
+    "data_type": "char",
+    "max_length": 64,
+    "extra": "STORED GENERATED",
+    "generation_expression": "sha2(`file_path`,256)",
+}
+FULL_HASH_INDEX_ONLY = {"full_hash_indexes": 1, "prefix_hash_indexes": 0}
+
+
+def health_ready_with_schema(column, indexes):
     connection = MagicMock()
     cursor = connection.cursor.return_value.__enter__.return_value
+    cursor.fetchone.side_effect = [column, indexes]
 
     with patch("main.get_db_connection", return_value=connection):
         response = client.get("/health/ready")
 
+    connection.close.assert_called_once_with()
+    return response, cursor
+
+
+def test_health_ready_queries_database_and_closes_connection():
+    response, cursor = health_ready_with_schema(VALID_FILE_PATH_HASH_COLUMN, FULL_HASH_INDEX_ONLY)
+
     assert response.status_code == 200
     assert response.json() == {"status": "ready"}
-    assert cursor.execute.call_count == 4
+    assert cursor.execute.call_count == 6
     assert "source_mtime" in cursor.execute.call_args_list[0].args[0]
     assert "protocol_version" in cursor.execute.call_args_list[1].args[0]
     assert "current_dispatch_id" in cursor.execute.call_args_list[2].args[0]
     assert "dispatch_id" in cursor.execute.call_args_list[3].args[0]
-    connection.close.assert_called_once_with()
+    assert "GENERATION_EXPRESSION" in cursor.execute.call_args_list[4].args[0]
+    assert "NON_UNIQUE=0" in cursor.execute.call_args_list[5].args[0]
+    assert "SUB_PART" in cursor.execute.call_args_list[5].args[0]
+
+
+@pytest.mark.parametrize(
+    "expression",
+    ["sha2(`file_path`,256)", "SHA2(file_path, 256)", "  Sha2( `file_path` ,\n256 ) "],
+)
+def test_health_ready_accepts_equivalent_generation_expression_spellings(expression):
+    column = {**VALID_FILE_PATH_HASH_COLUMN, "generation_expression": expression}
+
+    response, _ = health_ready_with_schema(column, FULL_HASH_INDEX_ONLY)
+
+    assert response.status_code == 200
+
+
+@pytest.mark.parametrize(
+    "column",
+    [
+        None,
+        {**VALID_FILE_PATH_HASH_COLUMN, "extra": "", "generation_expression": ""},
+        {**VALID_FILE_PATH_HASH_COLUMN, "extra": "VIRTUAL GENERATED"},
+        {**VALID_FILE_PATH_HASH_COLUMN, "generation_expression": "sha2(lower(`file_path`),256)"},
+        {**VALID_FILE_PATH_HASH_COLUMN, "generation_expression": "sha2(`file_path`,224)"},
+        {**VALID_FILE_PATH_HASH_COLUMN, "data_type": "varchar"},
+        {**VALID_FILE_PATH_HASH_COLUMN, "max_length": 32},
+    ],
+    ids=["missing", "plain", "virtual", "lower_path", "sha224", "varchar", "char32"],
+)
+def test_health_ready_returns_503_for_incompatible_file_path_hash_column(column):
+    response, _ = health_ready_with_schema(column, FULL_HASH_INDEX_ONLY)
+
+    assert response.status_code == 503
+
+
+@pytest.mark.parametrize(
+    "indexes",
+    [
+        {"full_hash_indexes": 0, "prefix_hash_indexes": 0},
+        {"full_hash_indexes": 0, "prefix_hash_indexes": 1},
+        {"full_hash_indexes": 1, "prefix_hash_indexes": 1},
+    ],
+    ids=["missing", "prefix_only", "full_and_prefix"],
+)
+def test_health_ready_returns_503_for_missing_or_prefix_hash_unique_index(indexes):
+    response, _ = health_ready_with_schema(VALID_FILE_PATH_HASH_COLUMN, indexes)
+
+    assert response.status_code == 503
+
+
+def test_db_pool_pings_connections_when_checked_out():
+    original_pool = main._db_pool
+    main._db_pool = None
+    try:
+        with patch("main.PooledDB") as mock_pooled_db:
+            main.get_db_pool()
+    finally:
+        main._db_pool = original_pool
+
+    assert mock_pooled_db.call_args.kwargs["ping"] == 1
 
 
 def test_health_ready_returns_503_when_database_is_unavailable():
@@ -980,6 +1058,116 @@ def test_trigger_dispatch_uploader_tasks_async_reruns_when_triggered_during_disp
     assert main._dispatch_trigger_pending.is_set() is False
 
 
+def _make_idle_dispatch_connection(on_close=None):
+    connection = MagicMock()
+    cursor = connection.cursor.return_value.__enter__.return_value
+    cursor.fetchall.return_value = []
+    cursor.rowcount = 0
+    if on_close is not None:
+        connection.close.side_effect = on_close
+    return connection
+
+
+def test_scheduled_and_triggered_uploader_dispatch_never_overlap():
+    state_lock = threading.Lock()
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_finished = threading.Event()
+    active = 0
+    max_active = 0
+    calls = 0
+
+    def on_close():
+        nonlocal active
+        with state_lock:
+            active -= 1
+            finished_calls = calls
+        if finished_calls >= 2:
+            second_finished.set()
+
+    def fake_get_db_connection():
+        nonlocal active, max_active, calls
+        with state_lock:
+            active += 1
+            calls += 1
+            current_call = calls
+            max_active = max(max_active, active)
+        if current_call == 1:
+            first_entered.set()
+            assert release_first.wait(5.0)
+        return _make_idle_dispatch_connection(on_close)
+
+    main._dispatch_trigger_pending.clear()
+    with patch("main.get_db_connection", side_effect=fake_get_db_connection):
+        scheduled = threading.Thread(target=main.dispatch_uploader_tasks, name="scheduled-dispatch")
+        scheduled.start()
+        assert first_entered.wait(2.0)
+        main.trigger_dispatch_uploader_tasks_async("403_quota:baicai_1@1")
+        time.sleep(0.5)
+        with state_lock:
+            overlap_seen = max_active
+        release_first.set()
+        scheduled.join(5.0)
+        assert second_finished.wait(5.0)
+
+    assert overlap_seen == 1
+    assert max_active == 1
+    assert calls == 2
+
+
+def test_uploader_dispatch_mutex_recovers_after_exception():
+    calls = 0
+
+    def flaky_get_db_connection():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("database temporarily unavailable")
+        return _make_idle_dispatch_connection()
+
+    with patch("main.get_db_connection", side_effect=flaky_get_db_connection):
+        with pytest.raises(RuntimeError):
+            main.dispatch_uploader_tasks()
+        assert main._dispatch_run_lock.locked() is False
+        assert main.dispatch_uploader_tasks() is True
+
+    assert calls == 2
+
+
+def test_uploader_dispatch_skips_when_db_lock_held_by_other_process(fake_dispatch_db_lock):
+    from conftest import make_fake_dispatch_lock_connection
+
+    lock_connection = make_fake_dispatch_lock_connection(acquired=0)
+    fake_dispatch_db_lock.side_effect = None
+    fake_dispatch_db_lock.return_value = lock_connection
+
+    with patch("main.get_db_connection") as mock_get_db_connection:
+        assert main.dispatch_uploader_tasks() is False
+
+    mock_get_db_connection.assert_not_called()
+    lock_connection.close.assert_called_once_with()
+    assert main._dispatch_run_lock.locked() is False
+
+
+def test_uploader_dispatch_releases_db_lock_on_same_connection_after_exception(fake_dispatch_db_lock):
+    from conftest import make_fake_dispatch_lock_connection
+
+    lock_connection = make_fake_dispatch_lock_connection(acquired=1)
+    fake_dispatch_db_lock.side_effect = None
+    fake_dispatch_db_lock.return_value = lock_connection
+    lock_cursor = lock_connection.cursor.return_value.__enter__.return_value
+
+    with patch("main.get_db_connection", side_effect=RuntimeError("boom")):
+        with pytest.raises(RuntimeError):
+            main.dispatch_uploader_tasks()
+
+    lock_sql = [call.args[0] for call in lock_cursor.execute.call_args_list]
+    assert any("GET_LOCK" in sql for sql in lock_sql)
+    assert any("RELEASE_LOCK" in sql for sql in lock_sql)
+    lock_connection.close.assert_called_once_with()
+    assert main._dispatch_run_lock.locked() is False
+
+
 def test_report_status_ignores_stale_dispatch_without_mutating_tasks(mock_db):
     mock_db.fetchone.return_value = {
         "role": "uploader",
@@ -1245,6 +1433,136 @@ def test_report_files_accepts_valid_node_hmac(mock_db):
     assert response.status_code == 200
     assert mock_db.executemany.call_args.args[1][0][0] == " movie.mkv "
     assert mock_db.executemany.call_args.args[1][0][1] == "/cache/downloads"
+
+
+def _signed_report_files_request(node_name: str, token: str, payload: dict) -> tuple[bytes, dict]:
+    raw_body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+    timestamp = "1700000000"
+    return raw_body, {
+        "Content-Type": "application/json",
+        "X-Baicai-Node": node_name,
+        "X-Baicai-Timestamp": timestamp,
+        "X-Baicai-Signature": main._node_signature(token, timestamp, raw_body),
+    }
+
+
+def _history_sync_payload(node_name: str) -> dict:
+    return {
+        "worker_node": node_name,
+        "worker_api_url": "http://127.0.0.1:8001/task/upload",
+        "protocol_version": 2,
+        "files": ["movie/already-on-target.mkv"],
+        "is_history_sync": True,
+        "upload_method": "move",
+    }
+
+
+def test_report_files_rejects_history_sync_from_ordinary_signed_node(mock_db):
+    token = "node-secret-token-123"
+    raw_body, headers = _signed_report_files_request(
+        "worker-node-1", token, _history_sync_payload("worker-node-1")
+    )
+
+    with patch.object(main, "WORKER_TOKEN_MAP", {"worker-node-1": token}), patch(
+        "main.time.time", return_value=1700000000
+    ):
+        response = client.post("/api/report_files", content=raw_body, headers=headers)
+
+    assert response.status_code == 403
+    mock_db.execute.assert_not_called()
+    mock_db.executemany.assert_not_called()
+
+
+def test_report_files_accepts_history_sync_from_init_scanner(mock_db):
+    token = "init-scanner-token-123"
+    raw_body, headers = _signed_report_files_request(
+        "Init_Scanner", token, _history_sync_payload("Init_Scanner")
+    )
+
+    with patch.object(main, "WORKER_TOKEN_MAP", {"Init_Scanner": token}), patch(
+        "main.time.time", return_value=1700000000
+    ):
+        response = client.post("/api/report_files", content=raw_body, headers=headers)
+
+    assert response.status_code == 200
+    assert mock_db.executemany.call_args.args[1][0][4] == "completed"
+
+
+def test_report_files_history_sync_node_allowlist_is_configurable(mock_db):
+    token = "history-node-token-123"
+    raw_body, headers = _signed_report_files_request(
+        "history-node-2", token, _history_sync_payload("history-node-2")
+    )
+
+    with patch.object(main, "WORKER_TOKEN_MAP", {"history-node-2": token}), patch.object(
+        main, "HISTORY_SYNC_NODE_NAMES", frozenset({"Init_Scanner", "history-node-2"}), create=True
+    ), patch("main.time.time", return_value=1700000000):
+        response = client.post("/api/report_files", content=raw_body, headers=headers)
+
+    assert response.status_code == 200
+
+
+def test_report_files_keeps_legacy_admin_bearer_history_sync_compatibility(mock_db):
+    response = client.post(
+        "/api/report_files",
+        json=_history_sync_payload("legacy-init-sync"),
+        headers=auth_headers(),
+    )
+
+    assert response.status_code == 200
+    assert mock_db.executemany.call_args.args[1][0][4] == "completed"
+
+
+def test_admin_bearer_with_non_ascii_token_returns_401(mock_db):
+    response = client.get(
+        "/api/upload_usage",
+        headers={"Authorization": "Bearer tést-token".encode("utf-8")},
+    )
+
+    assert response.status_code == 401
+    mock_db.execute.assert_not_called()
+
+
+def test_legacy_node_bearer_with_non_ascii_token_returns_401(mock_db):
+    payload = {
+        "worker_node": "worker-node-1",
+        "worker_api_url": "http://worker-node-1:8001/task/upload",
+        "files": [],
+    }
+
+    response = client.post(
+        "/api/report_files",
+        json=payload,
+        headers={"Authorization": "Bearer tést-token".encode("utf-8")},
+    )
+
+    assert response.status_code == 401
+    mock_db.execute.assert_not_called()
+
+
+def test_node_hmac_with_non_ascii_signature_returns_401(mock_db):
+    raw_body = json.dumps(
+        {
+            "worker_node": "worker-node-1",
+            "worker_api_url": "http://worker-node-1:8001/task/upload",
+            "files": [],
+        },
+        separators=(",", ":"),
+    ).encode()
+    headers = {
+        "Content-Type": "application/json",
+        "X-Baicai-Node": "worker-node-1",
+        "X-Baicai-Timestamp": "1700000000",
+        "X-Baicai-Signature": ("é" * 64).encode("utf-8"),
+    }
+
+    with patch.object(main, "WORKER_TOKEN_MAP", {"worker-node-1": "node-secret-token-123"}), patch(
+        "main.time.time", return_value=1700000000
+    ):
+        response = client.post("/api/report_files", content=raw_body, headers=headers)
+
+    assert response.status_code == 401
+    mock_db.execute.assert_not_called()
 
 
 def test_report_files_rejects_expired_node_hmac(mock_db):

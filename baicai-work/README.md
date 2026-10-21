@@ -25,7 +25,6 @@ cp .env.example .env
 至少填写：
 
 ```text
-API_TOKEN
 NODE_TOKEN
 CENTER_URL
 CENTER_API
@@ -35,7 +34,9 @@ TARGET_REMOTE_DIR
 ALLOWED_BASE_DIRS
 ```
 
-`NODE_TOKEN` 必须与 Center 的 `WORKER_TOKEN_MAP[WORKER_NODE_NAME]` 一致。协议 v2 默认使用 HMAC，保留 `ALLOW_LEGACY_BEARER_AUTH=false`、`SCANNER_SEND_BEARER_AUTH=false`；`API_TOKEN` 仍是必填兼容配置。
+`NODE_TOKEN` 必须与 Center 的 `WORKER_TOKEN_MAP[WORKER_NODE_NAME]` 一致。协议 v2 默认使用 HMAC，保留 `ALLOW_LEGACY_BEARER_AUTH=false`、`SCANNER_SEND_BEARER_AUTH=false` 时可以不配置 `API_TOKEN`。任一 legacy 开关为 `true` 时必须配置与 Center 一致的非空 `API_TOKEN`，否则启动失败。
+
+Cleaner 只搬运 Center 下发的本批文件（`rclone move --files-from-raw`），需要 rclone 1.52 或更高版本；中转目录中的其他文件保持不动。
 
 确认宿主机有 rclone 配置：
 

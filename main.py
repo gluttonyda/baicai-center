@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -91,6 +92,10 @@ _db_pool = None
 _db_pool_lock = threading.Lock()
 _dispatch_trigger_lock = threading.Lock()
 _dispatch_trigger_pending = threading.Event()
+# 定时任务与即时触发共用的 uploader 调度互斥；只做非阻塞获取，忙时由调用方决定跳过或稍后重试。
+_dispatch_run_lock = threading.Lock()
+DISPATCH_TRIGGER_RETRY_SECONDS = 0.2
+DISPATCH_TRIGGER_MAX_WAIT_SECONDS = max(1, int(os.getenv("DISPATCH_TRIGGER_MAX_WAIT_SECONDS", "120")))
 
 
 def _load_worker_api_url_map() -> dict[str, str]:
@@ -139,12 +144,22 @@ def _load_worker_token_map() -> dict[str, str]:
 
 
 WORKER_TOKEN_MAP = _load_worker_token_map()
+# 历史同步会把新路径直接写为 completed，只允许显式授权的签名节点提交；
+# legacy Bearer 持有管理员 API_TOKEN，仍保留旧 init_sync 的兼容入口。
+HISTORY_SYNC_NODE_NAMES = frozenset(
+    name.strip() for name in os.getenv("HISTORY_SYNC_NODE_NAMES", "Init_Scanner").split(",") if name.strip()
+)
 ALLOW_LEGACY_NODE_AUTH = os.getenv("ALLOW_LEGACY_NODE_AUTH", "false").lower() in ("1", "true", "yes")
 NODE_AUTH_MAX_CLOCK_SKEW_SECONDS = max(30, int(os.getenv("NODE_AUTH_MAX_CLOCK_SKEW_SECONDS", "300")))
 
 
+def secure_equals(left: str, right: str) -> bool:
+    # compare_digest 对含非 ASCII 的 str 会抛 TypeError，统一按 UTF-8 字节做常量时间比较。
+    return hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
+
+
 def verify_token(credentials: HTTPAuthorizationCredentials = Security(security)):
-    if credentials.credentials != API_TOKEN:
+    if not secure_equals(credentials.credentials, API_TOKEN):
         raise HTTPException(status_code=401, detail="Unauthorized")
     return credentials.credentials
 
@@ -177,11 +192,11 @@ async def verify_node_request(
 
         # 对原始请求体验签，避免 JSON 再序列化改变字节；时间窗口限制旧请求的重放范围。
         expected_signature = _node_signature(token, timestamp, await request.body())
-        if not hmac.compare_digest(expected_signature, supplied_signature.lower()):
+        if not secure_equals(expected_signature, supplied_signature.lower()):
             raise HTTPException(status_code=401, detail="节点签名无效")
         return {"method": "hmac", "node_name": node_name}
 
-    if ALLOW_LEGACY_NODE_AUTH and credentials is not None and credentials.credentials == API_TOKEN:
+    if ALLOW_LEGACY_NODE_AUTH and credentials is not None and secure_equals(credentials.credentials, API_TOKEN):
         return {"method": "legacy_bearer", "node_name": None}
     raise HTTPException(status_code=401, detail="Node authentication required")
 
@@ -216,7 +231,8 @@ def get_db_pool():
                 mincached=DB_MIN_CACHED,
                 maxcached=DB_MAX_CACHED,
                 blocking=True,
-                ping=0,
+                # 每次从池中取出连接时 ping，自动替换被服务端超时或 KILL 断开的空闲连接。
+                ping=1,
                 host=DB_HOST,
                 user=DB_USER,
                 password=DB_PASSWORD,
@@ -619,6 +635,59 @@ def uploader_group_has_active_lease(cursor, group_prefix: str) -> bool:
     return cursor.fetchone() is not None
 
 
+def _dispatch_db_lock_name() -> str:
+    # MySQL 命名锁在整个实例内共享，按库名区分，避免同实例上的其他库互相阻塞。
+    digest = hashlib.sha256(DB_NAME.encode("utf-8")).hexdigest()[:32]
+    return f"baicai-dispatch-uploader:{digest}"
+
+
+def _open_dispatch_lock_connection():
+    # 专用连接不进入连接池：GET_LOCK 归属于会话，归还池后可能被其他借用者重入或错误释放。
+    return pymysql.connect(
+        host=DB_HOST,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        database=DB_NAME,
+        cursorclass=pymysql.cursors.DictCursor,
+        autocommit=True,
+        connect_timeout=10,
+    )
+
+
+def _close_dispatch_lock_connection(connection) -> None:
+    try:
+        connection.close()
+    except Exception:
+        logger.warning("关闭 uploader 调度锁连接失败，MySQL 会在会话结束时释放命名锁。", exc_info=True)
+
+
+def _acquire_dispatch_db_lock():
+    """获取跨进程 uploader 调度锁；成功返回持锁连接，其他进程持锁时返回 None。"""
+    connection = _open_dispatch_lock_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT GET_LOCK(%s, 0) AS acquired", (_dispatch_db_lock_name(),))
+            row = cursor.fetchone() or {}
+    except Exception:
+        _close_dispatch_lock_connection(connection)
+        raise
+    if row.get("acquired") == 1:
+        return connection
+    _close_dispatch_lock_connection(connection)
+    return None
+
+
+def _release_dispatch_db_lock(connection) -> None:
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT RELEASE_LOCK(%s)", (_dispatch_db_lock_name(),))
+    except Exception:
+        logger.warning("释放 uploader 调度命名锁失败，将关闭持锁连接。", exc_info=True)
+    finally:
+        # 即使 RELEASE_LOCK 失败，关闭会话也会让 MySQL 释放该会话持有的命名锁。
+        _close_dispatch_lock_connection(connection)
+
+
 def trigger_dispatch_uploader_tasks_async(reason: str):
     _dispatch_trigger_pending.set()
 
@@ -630,7 +699,13 @@ def trigger_dispatch_uploader_tasks_async(reason: str):
             while _dispatch_trigger_pending.is_set():
                 _dispatch_trigger_pending.clear()
                 logger.info("🚀 触发即时 uploader 重调度：%s", reason)
-                dispatch_uploader_tasks()
+                deadline = time.monotonic() + DISPATCH_TRIGGER_MAX_WAIT_SECONDS
+                # 调度忙时稍后重试，避免与正在运行的定时调度重叠，也不丢失本次触发。
+                while dispatch_uploader_tasks() is False:
+                    if time.monotonic() >= deadline:
+                        logger.warning("⏳ uploader 调度持续占用，放弃本次即时触发，等待定时调度：%s", reason)
+                        break
+                    time.sleep(DISPATCH_TRIGGER_RETRY_SECONDS)
         except Exception:
             logger.exception("❌ 即时 uploader 重调度失败：%s", reason)
         finally:
@@ -1030,7 +1105,26 @@ def requeue_stale_not_found_tasks(cursor) -> int:
 
 
 # ================= 核心调度：大批次 + 节点限流 =================
-def dispatch_uploader_tasks():
+def dispatch_uploader_tasks() -> bool:
+    """定时与即时调度的唯一入口；返回 False 表示已有调度在运行，本次跳过。"""
+    if not _dispatch_run_lock.acquire(blocking=False):
+        logger.info("⏭️ 本进程已有 uploader 调度在运行，跳过本次调度。")
+        return False
+    try:
+        lock_connection = _acquire_dispatch_db_lock()
+        if lock_connection is None:
+            logger.info("⏭️ 其他 Center 进程正在执行 uploader 调度，跳过本次调度。")
+            return False
+        try:
+            _dispatch_uploader_tasks_locked()
+        finally:
+            _release_dispatch_db_lock(lock_connection)
+        return True
+    finally:
+        _dispatch_run_lock.release()
+
+
+def _dispatch_uploader_tasks_locked():
     current_limit = current_upload_concurrency_limit()
     logger.info("🧠 调度巡检：检查各节点负载并分发任务... 当前上传并发上限=%s", current_limit)
     db = get_db_connection()
@@ -1487,6 +1581,57 @@ app = FastAPI(lifespan=lifespan)
 def home(): return {"status": "Command Center Active"}
 
 
+FILE_PATH_HASH_GENERATION_EXPRESSION = "sha2(file_path,256)"
+
+
+def file_path_hash_schema_error(cursor) -> Optional[str]:
+    """检查 report_files 去重依赖的 file_path_hash 列与唯一索引；不满足时返回原因。"""
+    cursor.execute(
+        """
+        SELECT DATA_TYPE AS data_type, CHARACTER_MAXIMUM_LENGTH AS max_length,
+               EXTRA AS extra, GENERATION_EXPRESSION AS generation_expression
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='file_tasks' AND COLUMN_NAME='file_path_hash'
+        """
+    )
+    column = cursor.fetchone()
+    # information_schema 保存规范化后的表达式（如 sha2(`file_path`,256)），比较时忽略空白、反引号和大小写。
+    expression = re.sub(r"[\s`]", "", (column or {}).get("generation_expression") or "").lower()
+    if (
+        not column
+        or str(column["data_type"]).lower() != "char"
+        or column["max_length"] != 64
+        or "STORED GENERATED" not in str(column["extra"]).upper()
+        or expression != FILE_PATH_HASH_GENERATION_EXPRESSION
+    ):
+        # 普通列（上报时为 NULL）或其他表达式会让唯一索引失去按完整路径去重的意义。
+        return "file_tasks.file_path_hash 必须是 CHAR(64) AS (SHA2(file_path, 256)) STORED 生成列"
+    # 只含完整 file_path_hash 的唯一索引才能按完整哈希去重；前缀或表达式唯一索引会把
+    # 完整哈希不同的路径判为重复，让 ON DUPLICATE KEY UPDATE 改写另一条任务，必须人工删除。
+    cursor.execute(
+        """
+        SELECT COALESCE(SUM(key_parts=1 AND full_hash_parts=1), 0) AS full_hash_indexes,
+               COALESCE(SUM(prefix_hash_parts>0), 0) AS prefix_hash_indexes
+        FROM (
+            SELECT INDEX_NAME,
+                   COUNT(*) AS key_parts,
+                   SUM(COLUMN_NAME='file_path_hash' AND SUB_PART IS NULL) AS full_hash_parts,
+                   SUM((COLUMN_NAME='file_path_hash' AND SUB_PART IS NOT NULL)
+                       OR LOCATE('file_path_hash', COALESCE(EXPRESSION, ''))>0) AS prefix_hash_parts
+            FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='file_tasks' AND NON_UNIQUE=0
+            GROUP BY INDEX_NAME
+        ) unique_indexes
+        """
+    )
+    indexes = cursor.fetchone() or {}
+    if indexes.get("prefix_hash_indexes"):
+        return "file_tasks 存在 file_path_hash 前缀或表达式唯一索引，需人工删除，见 docs/center_node.md"
+    if not indexes.get("full_hash_indexes"):
+        return "file_tasks.file_path_hash 缺少完整唯一索引，请执行 MIGRATION_FILE_PATH_HASH.sql"
+    return None
+
+
 @app.get("/health/ready")
 def health_ready():
     db = None
@@ -1506,6 +1651,9 @@ def health_ready():
             cursor.execute(
                 "SELECT dispatch_id FROM account_upload_events LIMIT 0"
             )
+            schema_error = file_path_hash_schema_error(cursor)
+            if schema_error:
+                raise RuntimeError(schema_error)
         return {"status": "ready"}
     except Exception as exc:
         logger.error("数据库 readiness 检查失败: %s", exc)
@@ -1519,6 +1667,12 @@ def health_ready():
 def report_new_files(req: ReportFilesRequest, node_auth: dict[str, Optional[str]] = Depends(verify_node_request)):
     if node_auth["method"] == "hmac" and node_auth["node_name"] != req.worker_node:
         raise HTTPException(status_code=400, detail="签名节点与 worker_node 不一致")
+    if (
+        req.is_history_sync
+        and node_auth["method"] == "hmac"
+        and node_auth["node_name"] not in HISTORY_SYNC_NODE_NAMES
+    ):
+        raise HTTPException(status_code=403, detail=f"节点 [{req.worker_node}] 无权提交历史同步")
     db = get_db_connection()
     try:
         with db.cursor() as cursor:
@@ -1543,6 +1697,9 @@ def report_new_files(req: ReportFilesRequest, node_auth: dict[str, Optional[str]
 
             if accepted_files:
                 initial_status = "completed" if req.is_history_sync else "pending"
+                # MySQL 按从左到右执行 ON DUPLICATE KEY UPDATE 赋值，后续 CASE 中的 file_tasks.status
+                # 已是更新后的值：not_found/指纹变化的 completed 转为 pending 时会同时清空旧绑定并采用新指纹。
+                # status 必须保持为第一个赋值；tests/test_mysql_integration.py 在真实 MySQL 上覆盖了这些语义。
                 sql = """
                     INSERT INTO file_tasks
                         (file_path, source_base_dir, size_bytes, source_mtime, status, worker_node, upload_method)
@@ -2133,7 +2290,7 @@ def receive_worker_report(req: ReportStatusRequest, node_auth: dict[str, Optiona
                         cursor, req.account_name, req.dispatch_id
                     )
                     logger.info(
-                        "🧹 清道夫账号 [%s] 整盘移动成功，已将 dispatch [%s] 剩余 %s 条 staged 记录标记为 completed。",
+                        "🧹 清道夫账号 [%s] 本批清单移动成功，已将 dispatch [%s] 剩余 %s 条 staged 记录标记为 completed。",
                         req.account_name,
                         req.dispatch_id,
                         completed_count,

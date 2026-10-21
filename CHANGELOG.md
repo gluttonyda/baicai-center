@@ -1,6 +1,29 @@
 # 更新日志
 
-本文件记录代码行为和升级要求，不代表已对运行节点执行部署。日期使用 UTC；本次整理时间对应北京时间 2026-09-15。
+本文件记录代码行为和升级要求，不代表已对运行节点执行部署。日期使用 UTC；2026-09-14 一节的整理时间对应北京时间 2026-09-15。
+
+## 2026-10-21
+
+### 修复
+
+- 定时与即时 uploader 调度共用非阻塞互斥，不再重叠执行；跨进程使用专用连接上的 MySQL `GET_LOCK`，异常后释放。
+- Center 与 Worker 的令牌、签名和节点名比较改为按 UTF-8 字节常量时间比较，非 ASCII 输入返回 401/422，不再导致 500。
+- 只有 `HISTORY_SYNC_NODE_NAMES`（默认 `Init_Scanner`）中的签名节点可以提交历史同步；legacy 管理员 Bearer 保持兼容。
+- Worker 拒绝危险的 `account_name`/`dest_name`（以 `-` 开头、冒号、逗号、路径、空白或控制符）。
+- Worker/Scanner 在 HMAC-only 模式下不再要求 `API_TOKEN`；启用 legacy 时令牌为空会启动失败。
+- 连接池改为 `ping=1`，取出连接时替换已断开的连接。
+- Cleaner 只搬运本批 dispatch 文件，中转目录中的其他文件保持不动。
+
+### 新增
+
+- `MIGRATION_FILE_PATH_HASH.sql`：补齐 `file_path_hash` 生成列和完整唯一索引；发现重复路径、不兼容的已有列（普通列、其他表达式、VIRTUAL、非 `CHAR(64)`）或前缀/表达式唯一索引时终止且不改数据。`/health/ready` 增加对应检查。
+- `tests/test_mysql_integration.py`：真实 MySQL 8 集成测试，未配置 `BAICAI_TEST_MYSQL_*` 时跳过。
+
+### 升级与验证
+
+- 旧库在原有三项迁移之后执行 `MIGRATION_FILE_PATH_HASH.sql`。
+- 在隔离测试容器（MySQL 8.4.8、内部网络、仅测试凭据）中执行全量测试：**236 passed**（含 26 个真库用例），另有 4 条 FastAPI `on_event` 弃用警告。没有对生产数据库或运行节点执行变更。
+- 兼容影响、局限和后续问题见 [2026-10-21 调度互斥与鉴权加固说明](docs/CODE_CHANGES_20261021.md)。
 
 ## 2026-09-14
 

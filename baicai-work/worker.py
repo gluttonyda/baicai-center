@@ -34,7 +34,11 @@ def require_env(name: str) -> str:
     return value
 
 
-API_TOKEN = require_env("API_TOKEN")
+ALLOW_LEGACY_BEARER_AUTH = os.getenv("ALLOW_LEGACY_BEARER_AUTH", "false").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+# 共享 API_TOKEN 只用于 legacy Bearer 兼容；HMAC-only 部署可以不配置。
+API_TOKEN = require_env("API_TOKEN") if ALLOW_LEGACY_BEARER_AUTH else os.getenv("API_TOKEN", "").strip()
 NODE_TOKEN = require_env("NODE_TOKEN")
 CENTER_URL = require_env("CENTER_URL").rstrip("/")
 TARGET_REMOTE_DIR = require_env("TARGET_REMOTE_DIR")
@@ -48,9 +52,6 @@ TASK_JOURNAL_RETENTION_DAYS = max(1, int(os.getenv("TASK_JOURNAL_RETENTION_DAYS"
 REPORT_RETRY_INTERVAL_SECONDS = max(1, int(os.getenv("REPORT_RETRY_INTERVAL_SECONDS", "30")))
 REMOTE_PROBE_TIMEOUT_SECONDS = max(1, int(os.getenv("REMOTE_PROBE_TIMEOUT_SECONDS", "120")))
 NODE_SIGNATURE_MAX_AGE_SECONDS = max(30, int(os.getenv("NODE_SIGNATURE_MAX_AGE_SECONDS", "300")))
-ALLOW_LEGACY_BEARER_AUTH = os.getenv("ALLOW_LEGACY_BEARER_AUTH", "false").strip().lower() in {
-    "1", "true", "yes", "on"
-}
 RCLONE_BWLIMIT = os.getenv("RCLONE_BWLIMIT", "").strip()
 RCLONE_TRANSFERS = max(1, int(os.getenv("RCLONE_TRANSFERS", "4")))
 RCLONE_CHECKERS = max(1, int(os.getenv("RCLONE_CHECKERS", "8")))
@@ -78,6 +79,20 @@ cancelled_dispatches_lock = threading.Lock()
 current_task_payload: ContextVar[Optional["TaskPayload"]] = ContextVar(
     "current_task_payload", default=None
 )
+
+
+def secure_equals(left: str, right: str) -> bool:
+    # compare_digest 对含非 ASCII 的 str 会抛 TypeError，统一按 UTF-8 字节做常量时间比较。
+    return hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
+
+
+# 账号名会拼成 rclone 参数 "<name>:<dir>"：禁止以 - 开头（选项注入）、冒号/逗号（连接串与后端参数）、
+# 路径分隔符、空白和控制符；兼容现有 baicai_1@1、baicai-1@1-3、baicai-big2 等命名。
+SAFE_REMOTE_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}")
+
+
+def is_safe_remote_name(value: str) -> bool:
+    return SAFE_REMOTE_NAME_PATTERN.fullmatch(value) is not None
 
 class TaskPayload(BaseModel):
     dispatch_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
@@ -109,16 +124,15 @@ class TaskPayload(BaseModel):
             return None
         if any(char in value for char in ("\x00", "\r", "\n")):
             raise ValueError("worker_node 非法")
-        if not hmac.compare_digest(value, WORKER_NODE_NAME):
+        if not secure_equals(value, WORKER_NODE_NAME):
             raise ValueError("任务 worker_node 与本节点身份不匹配")
         return value
 
     @field_validator("account_name")
     @classmethod
     def validate_account_name(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("account_name 不能为空")
+        if not is_safe_remote_name(value):
+            raise ValueError("account_name 必须是安全的 rclone remote 名称")
         return value
 
     @field_validator("dest_name")
@@ -126,9 +140,8 @@ class TaskPayload(BaseModel):
     def validate_dest_name(cls, value: Optional[str]) -> Optional[str]:
         if value is None:
             return value
-        value = value.strip()
-        if not value:
-            raise ValueError("dest_name 不能为空字符串")
+        if not is_safe_remote_name(value):
+            raise ValueError("dest_name 必须是安全的 rclone remote 名称")
         return value
 
     @field_validator("remote_dir")
@@ -429,7 +442,7 @@ def should_ignore_upload_file(file_path: str) -> bool:
 
 
 def verify_token(credentials: Optional[HTTPAuthorizationCredentials] = Security(security)):
-    if credentials is None or not hmac.compare_digest(credentials.credentials, API_TOKEN):
+    if credentials is None or not API_TOKEN or not secure_equals(credentials.credentials, API_TOKEN):
         raise HTTPException(status_code=401, detail="Unauthorized")
     return credentials.credentials
 
@@ -447,7 +460,7 @@ async def verify_task_auth(
     timestamp = request.headers.get("X-Baicai-Timestamp", "")
     provided_signature = request.headers.get("X-Baicai-Signature", "")
     if node_name and timestamp and provided_signature:
-        if not hmac.compare_digest(node_name, WORKER_NODE_NAME):
+        if not secure_equals(node_name, WORKER_NODE_NAME):
             raise HTTPException(status_code=401, detail="node identity mismatch")
         try:
             signed_at = int(timestamp)
@@ -456,14 +469,15 @@ async def verify_task_auth(
         if abs(int(time.time()) - signed_at) > NODE_SIGNATURE_MAX_AGE_SECONDS:
             raise HTTPException(status_code=401, detail="expired signature timestamp")
         expected_signature = make_node_signature(timestamp, await request.body())
-        if not hmac.compare_digest(provided_signature, expected_signature):
+        if not secure_equals(provided_signature, expected_signature):
             raise HTTPException(status_code=401, detail="invalid node signature")
         return node_name
 
     if (
         ALLOW_LEGACY_BEARER_AUTH
+        and API_TOKEN
         and credentials is not None
-        and hmac.compare_digest(credentials.credentials, API_TOKEN)
+        and secure_equals(credentials.credentials, API_TOKEN)
     ):
         return "legacy"
     raise HTTPException(status_code=401, detail="node signature required")
@@ -1087,7 +1101,11 @@ def run_cleaner(
         if not file_path or any(char in file_path for char in ("\x00", "\r", "\n")):
             logger.warning("🧹 [CLEAN-%s] 拒绝非法清理路径: %r", account_name, file_path)
             continue
-        normalized_path = file_path.replace("\\", "/")
+        # 与上传时 resolve_task_path 的远端相对路径规则一致，保证清单指向中转盘上的同一文件。
+        normalized_path = os.path.normpath(file_path.lstrip("/"))
+        if normalized_path in ("", ".") or normalized_path == ".." or normalized_path.startswith("../"):
+            logger.warning("🧹 [CLEAN-%s] 拒绝越界清理路径: %r", account_name, file_path)
+            continue
         if normalized_path not in requested_files_seen:
             requested_files_seen.add(normalized_path)
             requested_report_files.append(normalized_path)
@@ -1098,7 +1116,7 @@ def run_cleaner(
         return
 
     logger.info(
-        "🧹 清道夫启动: %s -> %s，执行整盘移动；本次数据库批次 %s 个文件。",
+        "🧹 清道夫启动: %s -> %s，按本批清单移动 %s 个文件。",
         account_name,
         dest_name,
         len(requested_report_files),
@@ -1112,11 +1130,18 @@ def run_cleaner(
         logger.error("❌ 清道夫无法解析目标盘配置: %s", error)
         report_status(account_name, "failed")
         return
+    # 只搬运本次 dispatch 的文件；raw 清单不裁剪首尾空白、不把 #/; 开头视为注释。
+    fd, files_from_path = tempfile.mkstemp(prefix="bc_clean_", suffix=".txt")
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        for file_path in requested_report_files:
+            handle.write(f"{file_path}\n")
     cmd = [
         "rclone",
         "move",
         f"{account_name}:{task_remote_dir}",
         cleaner_destination,
+        "--files-from-raw",
+        files_from_path,
         "--drive-server-side-across-configs",
         "--drive-use-trash=false",
         "--delete-empty-src-dirs",
@@ -1208,7 +1233,7 @@ def run_cleaner(
                 return
             if p.returncode == 0:
                 logger.info(
-                    "🧹 [CLEAN-%s] 整盘移动完成，通知大脑完成 dispatch 批次（%s 个文件）。",
+                    "🧹 [CLEAN-%s] 本批清单移动完成，通知大脑完成 dispatch 批次（%s 个文件）。",
                     account_name,
                     len(requested_report_files),
                 )
@@ -1216,7 +1241,7 @@ def run_cleaner(
             else:
                 error_summary = " | ".join(error_tail)[:1500] or "无错误输出"
                 logger.error(
-                    "🧹 [CLEAN-%s] 整盘移动失败（退出码=%s），仅保留末尾摘要: %s",
+                    "🧹 [CLEAN-%s] 本批清单移动失败（退出码=%s），仅保留末尾摘要: %s",
                     account_name,
                     p.returncode,
                     error_summary,
@@ -1230,6 +1255,9 @@ def run_cleaner(
     except Exception as e:
         logger.error(f"❌ 清道夫崩溃: {e}")
         report_status(account_name, "failed")
+    finally:
+        if os.path.exists(files_from_path):
+            os.remove(files_from_path)
 
 def task_router(payload: TaskPayload):
     context_token = current_task_payload.set(payload)

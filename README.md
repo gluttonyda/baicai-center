@@ -2,7 +2,7 @@
 
 Baicai Center 是一个用于分布式 Google Drive 搬运的主控调度系统。
 
-本次版本变化见 [中文更新日志](CHANGELOG.md) 和 [代码差异说明](docs/CODE_CHANGES_20260914.md)。
+本次版本变化见 [中文更新日志](CHANGELOG.md)、[2026-10-21 调度互斥与鉴权加固说明](docs/CODE_CHANGES_20261021.md) 和 [2026-09-14 代码差异说明](docs/CODE_CHANGES_20260914.md)。
 
 它的核心目标是让一个中心节点充当“主控大脑”，统一接收文件清单、管理账号池、调度多个地区的 Worker 节点，并在 Google Drive 上传配额触发后自动切换账号继续搬运。
 
@@ -51,6 +51,7 @@ Baicai Center 是一个用于分布式 Google Drive 搬运的主控调度系统�
 - `SCHEMA_MINIMAL.sql`：最小可运行表结构
 - `MIGRATION_SPLIT_ACCOUNT_LOCKS.sql`：账号锁字段拆分迁移
 - `MIGRATION_DISPATCH_PROTOCOL_V2.sql`：节点签名、可恢复调度租约、来源指纹迁移
+- `MIGRATION_FILE_PATH_HASH.sql`：补齐 `file_tasks.file_path_hash` 及完整唯一索引；遇到重复路径、不兼容的已有列或前缀唯一索引时终止且不改数据
 - `scripts/`：数据库检查和维护脚本
 
 Center 维护以下状态：
@@ -97,7 +98,7 @@ GET  /api/upload_usage/daily
 4. Center 定时选择可用 Worker 和可用 uploader 账号。
 5. Worker 收到任务后用 `rclone copy` 或 `rclone move` 执行搬运。
 6. 普通 uploader 成功后，任务进入 `staged`。
-7. Cleaner 账号把 `staged` 文件从中转盘移动到最终目标盘。
+7. Cleaner 账号把本批 `staged` 文件按清单从中转盘移动到最终目标盘（`rclone move --files-from-raw`），中转目录里不在清单中的文件保持不动。
 8. Cleaner 成功后，任务进入 `completed`。
 
 任务状态：
@@ -128,7 +129,7 @@ pending -> uploading -> staged -> completed
 1. Center 释放短期调度锁。
 2. Center 写入 `quota_blocked_until`。
 3. 当前未完成任务回退到 `pending`。
-4. Center 立即触发新一轮 uploader 调度。
+4. Center 立即触发新一轮 uploader 调度。即时调度与每 60 秒的定时调度共用互斥，不会同时运行；多个 Center 进程之间另有 MySQL `GET_LOCK` 保护（只是抢不到就跳过，没有实现选主）。
 
 Cleaner 策略：
 
@@ -166,15 +167,16 @@ WORKER_API_URL_MAP
 mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASSWORD" "$DB_NAME" < SCHEMA_MINIMAL.sql
 ```
 
-如果是旧库升级，需要执行：
+如果是旧库升级，先停止 Center 和 Scanner，再执行：
 
 ```bash
 mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASSWORD" "$DB_NAME" < MIGRATION_SPLIT_ACCOUNT_LOCKS.sql
 mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASSWORD" "$DB_NAME" < MIGRATION_UPLOAD_USAGE_STATS.sql
 mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASSWORD" "$DB_NAME" < MIGRATION_DISPATCH_PROTOCOL_V2.sql
+mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASSWORD" "$DB_NAME" < MIGRATION_FILE_PATH_HASH.sql
 ```
 
-以上迁移检查缺失字段和索引后再添加。执行前仍需备份；MySQL DDL 可能隐式提交，不能依靠单个事务回滚整个升级。迁移不会自动解释或清空旧账号的配额封禁与人工停用状态。
+以上迁移检查缺失字段和索引后再添加，可以重复执行。执行前仍需备份；MySQL DDL 可能隐式提交，不能依靠单个事务回滚整个升级。迁移不会自动解释或清空旧账号的配额封禁与人工停用状态。如果 `file_tasks` 中存在完全相同的 `file_path` 多行，`MIGRATION_FILE_PATH_HASH.sql` 会以 `MIGRATION_ABORTED_duplicate_file_path_rows_see_docs` 错误终止，不删除任何数据。已有 `file_path_hash` 列不是 `CHAR(64) AS (SHA2(file_path, 256)) STORED`，或该列上存在前缀/表达式唯一索引（例如 `UNIQUE (file_path_hash(1))`，会把完整哈希不同的路径判为重复）时，脚本分别以 `MIGRATION_ABORTED_incompatible_file_path_hash_column_see_docs`、`MIGRATION_ABORTED_prefix_unique_file_path_hash_index_see_docs` 终止，不覆盖列、不删除索引，`/health/ready` 也返回 503。人工处理方法见 [Center 节点说明](docs/center_node.md#file_path_hash-迁移)。
 
 数据库准备完成后启动 Center，并检查数据库就绪状态：
 
@@ -201,7 +203,7 @@ TARGET_DIR=your-target-dir
 
 不要用真实 Worker 节点名运行 `init_sync.py`，否则可能覆盖真实 Worker 的注册地址。
 
-使用协议 v2 时，还需为 `Init_Scanner` 在 `WORKER_TOKEN_MAP` 中单独配置密钥，并给导入进程设置匹配的 `NODE_TOKEN`。
+使用协议 v2 时，还需为 `Init_Scanner` 在 `WORKER_TOKEN_MAP` 中单独配置密钥，并给导入进程设置匹配的 `NODE_TOKEN`（`init_sync.py` 不需要 `API_TOKEN`）。Center 只接受 `HISTORY_SYNC_NODE_NAMES`（默认 `Init_Scanner`）中的签名节点提交历史同步，其他签名节点会收到 403；legacy 管理员 Bearer 仍保持兼容。
 
 ### 4. 部署 Worker
 
@@ -215,7 +217,6 @@ cp .env.example .env
 至少填写：
 
 ```text
-API_TOKEN
 CENTER_URL
 CENTER_API
 WORKER_NODE_NAME
@@ -223,6 +224,8 @@ WORKER_API_URL
 TARGET_REMOTE_DIR
 NODE_TOKEN
 ```
+
+HMAC-only 部署不需要 `API_TOKEN`。只有开启 `ALLOW_LEGACY_BEARER_AUTH=true` 或 `SCANNER_SEND_BEARER_AUTH=true` 时才必须填写与 Center 一致的非空值，否则启动失败。
 
 Center 使用 `STAGING_REMOTE_DIR`、`LEGACY_DIRECT_REMOTE_DIR` 和
 `CLEANER_DEST_REMOTE` 决定每个任务的实际远端。当前路由为：普通中转账号与
@@ -288,6 +291,18 @@ pip install -r baicai-work/requirements.txt
 PYTHONPATH=.:baicai-work pytest -q
 ```
 
+`tests/test_mysql_integration.py` 需要真实 MySQL 8。未设置下列环境变量时，这些用例显示为 skipped，不会失败：
+
+```bash
+BAICAI_TEST_MYSQL_HOST=127.0.0.1 \
+BAICAI_TEST_MYSQL_USER=root \
+BAICAI_TEST_MYSQL_PASSWORD='<测试库密码>' \
+BAICAI_TEST_MYSQL_DATABASE=baicai_review \
+PYTHONPATH=.:baicai-work pytest -q tests/test_mysql_integration.py
+```
+
+每个用例都会创建 `review_` 前缀的临时库并在结束后删除，测试账号需要建库和删库权限，不要指向生产实例。`tests/test_worker_integration.py` 的 cleaner 用例会调用 `PATH` 中的真实 `rclone`（只访问本地临时目录）。
+
 测试数量会随协议和回归用例调整，以 `pytest` 最终输出为准，不在文档中维护容易失真的固定数字。
 
 ## 安全说明
@@ -305,6 +320,8 @@ PYTHONPATH=.:baicai-work pytest -q
 - GitHub 登录凭据和部署专用的一次性 SQL
 
 本仓库已通过 `.gitignore` 忽略这些内容。公开仓库中只应保留 `.env.example`。
+
+`WORKER_API_URL_MAP` 为空时，Center 会信任节点上报的 `worker_api_url` 并向该地址发起请求。为兼容现有部署，空映射仍允许启动；生产环境应配置完整白名单。
 
 ## 文档
 
