@@ -2145,6 +2145,7 @@ def test_mark_successful_uploads_keeps_concurrency_guards():
 
     # 更新后再按「目标状态 + dispatch_id IS NULL」确认真正生效的 id，用量事件只按这些 id 记。
     verify_sql = next(sql for sql in executed if "SELECT id FROM file_tasks" in sql)
+    assert "account_used=%s" in verify_sql
     assert "status=%s" in verify_sql
     assert "dispatch_id IS NULL" in verify_sql
 

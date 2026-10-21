@@ -999,10 +999,11 @@ def mark_successful_uploads_by_files(
             f"""
             SELECT id FROM file_tasks
             WHERE id IN ({format_strings})
+              AND account_used=%s
               AND status=%s
               AND dispatch_id IS NULL
             """,
-            chunk + [target_status],
+            chunk + [account_name, target_status],
         )
         updated_ids.extend(int(row["id"]) for row in (cursor.fetchall() or []))
     record_upload_usage_events_for_task_ids(cursor, account_name, updated_ids, dispatch_id)
