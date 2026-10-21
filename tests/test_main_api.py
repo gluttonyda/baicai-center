@@ -1,7 +1,9 @@
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from datetime import datetime, timedelta, timezone
+import errno
 import httpx
+import ipaddress
 import json
 import logging
 import os
@@ -233,9 +235,12 @@ def test_report_status_403_quota(mock_db):
         "successful_files": [],
     }
 
-    response = client.post("/api/report_status", json=payload, headers=auth_headers())
+    # 不让真实后台调度线程越过 mock_db 的生命周期，只断言触发契约。
+    with patch("main.trigger_dispatch_uploader_tasks_async") as trigger:
+        response = client.post("/api/report_status", json=payload, headers=auth_headers())
 
     assert response.status_code == 200
+    trigger.assert_called_once_with("403_quota:baicai_2@1")
     sql_calls = [call[0][0] for call in mock_db.execute.call_args_list]
     assert any("dispatch_locked_until = NULL" in sql and "quota_blocked_until = DATE_ADD" in sql for sql in sql_calls)
     assert any("UPDATE file_tasks SET status='pending'" in sql for sql in sql_calls)
@@ -248,9 +253,11 @@ def test_report_status_credential_invalid_disables_account(mock_db):
         "successful_files": [],
     }
 
-    response = client.post("/api/report_status", json=payload, headers=auth_headers())
+    with patch("main.trigger_dispatch_uploader_tasks_async") as trigger:
+        response = client.post("/api/report_status", json=payload, headers=auth_headers())
 
     assert response.status_code == 200
+    trigger.assert_called_once_with("credential_invalid:baicai_big@1")
     sql_calls = [call[0][0] for call in mock_db.execute.call_args_list]
     assert any("SET is_active = 0" in sql and "dispatch_locked_until = NULL" in sql for sql in sql_calls)
     assert any("UPDATE file_tasks SET status='pending'" in sql for sql in sql_calls)
@@ -1965,6 +1972,70 @@ def test_dispatch_cleaner_tasks_uses_registry_url_when_url_map_empty():
     assert targets == [(STALE_REGISTRY_URL, "worker-node-1")]
 
 
+PUBLIC_TEST_ADDRESS = "93.184.216.34"
+FLAKY_NODE_URL = "http://flaky-node:8001/task/upload"
+HEALTHY_NODE_URL = "http://worker-node-1:8001/task/upload"
+
+
+def _resolver_failing_for(failing_host, error):
+    """failing_host 的解析抛 error，其余主机解析到公网地址（不依赖 conftest 默认桩）。"""
+    def _resolve(host, port, *args, **kwargs):
+        if host == failing_host:
+            raise error
+        return [(2, 1, 6, "", (PUBLIC_TEST_ADDRESS, port))]
+
+    return _resolve
+
+
+def _account_lease_attempts(cursor):
+    """acquire_account_lock 发出的 (账号, 节点)；派发前被跳过的节点不应出现在这里。"""
+    return [
+        (params[3], params[2])
+        for sql, params in cursor.executed
+        if "SET dispatch_locked_until = DATE_ADD" in sql
+    ]
+
+
+def _isolate_resolver_failure(monkeypatch):
+    monkeypatch.setattr(
+        main.socket,
+        "getaddrinfo",
+        _resolver_failing_for("flaky-node", OSError(errno.EMFILE, "Too many open files")),
+    )
+    monkeypatch.setattr(main, "TRUST_SELF_REPORTED_WORKER_API_URL", True)
+    monkeypatch.setattr(main, "WORKER_API_ALLOWED_HOSTS", frozenset())
+    main._DNS_CACHE.clear()
+
+
+def test_dispatch_uploader_tasks_skips_node_whose_resolver_raises_oserror_and_continues(monkeypatch, caplog):
+    """解析线程抛出非 gaierror 的 OSError：只拒绝该节点，继续尝试排在后面的节点。"""
+    _isolate_resolver_failure(monkeypatch)
+    cursor = _uploader_dispatch_cursor([
+        {"node_name": "flaky-node", "api_url": FLAKY_NODE_URL},
+        {"node_name": "worker-node-1", "api_url": HEALTHY_NODE_URL},
+    ])
+
+    with caplog.at_level(logging.WARNING):
+        targets = _run_dispatch_and_collect_targets(main.dispatch_uploader_tasks, cursor, {})
+
+    assert targets == [(HEALTHY_NODE_URL, "worker-node-1")]
+    # 故障节点在获取账号租约之前就被跳过；本节点的任务锁定/回滚都在租约获取之后。
+    assert _account_lease_attempts(cursor) == [("baicai_2@1", "worker-node-1")]
+    assert any(r.levelno == logging.WARNING and "flaky-node" in r.getMessage() for r in caplog.records)
+
+
+def test_dispatch_cleaner_tasks_skips_node_whose_resolver_raises_oserror_and_continues(monkeypatch, caplog):
+    _isolate_resolver_failure(monkeypatch)
+    cursor = _cleaner_dispatch_cursor({"flaky-node": FLAKY_NODE_URL, "worker-node-1": HEALTHY_NODE_URL})
+
+    with caplog.at_level(logging.WARNING):
+        targets = _run_dispatch_and_collect_targets(main.dispatch_cleaner_tasks, cursor, {})
+
+    assert targets == [(HEALTHY_NODE_URL, "worker-node-1")]
+    assert _account_lease_attempts(cursor) == [("baicai_2-cleaner@1", "worker-node-1")]
+    assert any(r.levelno == logging.WARNING and "flaky-node" in r.getMessage() for r in caplog.records)
+
+
 UNSAFE_API_URLS = [
     ("http://admin:s3cret@worker-node-1:8001/task/upload", "用户信息"),
     ("http://admin@worker-node-1:8001/task/upload", "用户信息"),
@@ -2305,6 +2376,115 @@ def test_verify_dispatch_target_rejects_unresolvable_host(monkeypatch):
     monkeypatch.setattr(main.socket, "getaddrinfo", _boom)
     with pytest.raises(ValueError):
         main.verify_dispatch_target("http://does-not-exist:8001/task/upload")
+
+
+def test_verify_dispatch_target_rejects_host_when_resolver_raises_plain_oserror(monkeypatch):
+    """解析线程里的非 gaierror OSError 同样 fail-closed 成 ValueError，原异常作为 cause 保留。"""
+    error = OSError(errno.EMFILE, "Too many open files")
+    assert not isinstance(error, main.socket.gaierror)
+
+    def _fail(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(main.socket, "getaddrinfo", _fail)
+    monkeypatch.setattr(main, "WORKER_API_ALLOWED_HOSTS", frozenset())
+    main._DNS_CACHE.clear()
+
+    with pytest.raises(ValueError) as excinfo:
+        main.verify_dispatch_target("http://worker-node-1:8001/task/upload")
+
+    assert excinfo.value.__cause__ is error
+
+
+def test_resolve_dispatch_api_url_propagates_programming_errors_from_resolver(monkeypatch):
+    """只有 OSError 按"不可派发"处理；编程错误必须原样抛出，不能被吞成一次跳过。"""
+    bug = TypeError("resolver called with wrong arguments")
+    calls = []
+
+    def _buggy(*args, **kwargs):
+        calls.append(args)
+        raise bug
+
+    monkeypatch.setattr(main.socket, "getaddrinfo", _buggy)
+    monkeypatch.setattr(main, "WORKER_API_URL_MAP", {})
+    monkeypatch.setattr(main, "TRUST_SELF_REPORTED_WORKER_API_URL", True)
+    monkeypatch.setattr(main, "WORKER_API_ALLOWED_HOSTS", frozenset())
+    main._DNS_CACHE.clear()
+
+    with pytest.raises(TypeError) as excinfo:
+        main.resolve_dispatch_api_url("worker-node-1", "http://worker-node-1:8001/task/upload")
+
+    assert excinfo.value is bug
+    assert calls
+
+
+@pytest.mark.parametrize(
+    ("error", "errno_text"),
+    [
+        (OSError(errno.EIO, "SENTINEL-STRERROR", "SENTINEL-FILENAME"), f"errno={errno.EIO}"),
+        (OSError("SENTINEL-ONLY-ARG"), "errno=未知"),
+        (OSError("SENTINEL-ERRNO", "SENTINEL-STRERROR"), "errno=未知"),
+    ],
+    ids=["numeric-errno", "missing-errno", "non-numeric-errno"],
+)
+def test_dispatch_url_resolver_oserror_warning_omits_exception_text(monkeypatch, caplog, error, errno_text):
+    """strerror/filename/args 是异常携带的数据，不进告警：只留节点、异常类型和整数 errno。"""
+    def _fail(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(main.socket, "getaddrinfo", _fail)
+    monkeypatch.setattr(main, "WORKER_API_URL_MAP", {})
+    monkeypatch.setattr(main, "TRUST_SELF_REPORTED_WORKER_API_URL", True)
+    monkeypatch.setattr(main, "WORKER_API_ALLOWED_HOSTS", frozenset())
+    main._DNS_CACHE.clear()
+
+    with caplog.at_level(logging.WARNING):
+        assert main.resolve_dispatch_api_url("worker-node-1", "http://worker-node-1:8001/task/upload") is None
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("worker-node-1" in message and "OSError" in message and errno_text in message for message in warnings)
+    assert "SENTINEL" not in caplog.text
+
+
+def test_default_dns_stub_resolves_to_public_address_accepted_in_strict_mode(monkeypatch):
+    """conftest 的默认解析桩必须给真正的公网地址：TEST-NET 段在 Python 里算 is_private，
+    会让主机名用例隐式走"内网放行"分支，严格模式下反而被拒。"""
+    monkeypatch.setattr(main, "ALLOW_PRIVATE_WORKER_URLS", False)
+    monkeypatch.setattr(main, "WORKER_API_ALLOWED_HOSTS", frozenset())
+    main._DNS_CACHE.clear()
+
+    infos = main.socket.getaddrinfo("worker-node-1", 8001, type=main.socket.SOCK_STREAM)
+    addresses = {info[4][0] for info in infos}
+    assert addresses
+    for address in addresses:
+        ip = ipaddress.ip_address(address)
+        assert ip.is_global and not ip.is_private, address
+
+    assert main.verify_dispatch_target("http://worker-node-1:8001/task/upload")
+
+
+def test_strict_mode_dispatch_url_follows_resolved_address_class(monkeypatch):
+    """严格模式下的自报主机名：解析到公网放行，解析到普通私网或元数据一律拒绝。"""
+    monkeypatch.setattr(main, "ALLOW_PRIVATE_WORKER_URLS", False)
+    monkeypatch.setattr(main, "WORKER_API_ALLOWED_HOSTS", frozenset())
+    monkeypatch.setattr(main, "WORKER_API_URL_MAP", {})
+    monkeypatch.setattr(main, "TRUST_SELF_REPORTED_WORKER_API_URL", True)
+    answers = {
+        "public-worker": PUBLIC_TEST_ADDRESS,
+        "private-worker": "172.18.0.5",
+        "metadata-worker": "169.254.169.254",
+    }
+    monkeypatch.setattr(
+        main.socket,
+        "getaddrinfo",
+        lambda host, port, *args, **kwargs: [(2, 1, 6, "", (answers[host], port))],
+    )
+    main._DNS_CACHE.clear()
+
+    public_url = "http://public-worker:8001/task/upload"
+    assert main.resolve_dispatch_api_url("public-worker", public_url) == public_url
+    assert main.resolve_dispatch_api_url("private-worker", "http://private-worker:8001/task/upload") is None
+    assert main.resolve_dispatch_api_url("metadata-worker", "http://metadata-worker:8001/task/upload") is None
 
 
 def test_dispatch_url_resolution_rejects_registered_metadata_address(monkeypatch):

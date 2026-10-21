@@ -293,6 +293,11 @@ def _verify_resolved_addresses(host: str, port: int, allow_private: bool = False
         infos = _getaddrinfo_with_timeout(host, port)
     except socket.gaierror as exc:
         raise ValueError("worker_api_url 的主机名无法解析") from exc
+    except OSError as exc:
+        # 非 gaierror 的 OSError（如 CPython 对 EAI_SYSTEM 的映射）同样按不可派发处理：只跳过该节点，
+        # 不能穿透调度循环。strerror/filename 是异常携带的数据，不进消息，只留类型和整数 errno。
+        errno_value = exc.errno if type(exc.errno) is int else "未知"
+        raise ValueError(f"worker_api_url 的主机名解析出错（{type(exc).__name__}, errno={errno_value}）") from exc
     addresses = {info[4][0] for info in infos}
     if not addresses:
         raise ValueError("worker_api_url 的主机名没有解析出任何地址")
