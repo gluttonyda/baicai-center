@@ -1827,8 +1827,8 @@ def test_run_uploader_passes_explicit_log_format():
         worker.run_uploader("baicai_1@1", ["movie/a.mkv"], "copy")
 
     cmd = mock_popen.call_args.args[0]
-    assert "--log-format" in cmd
-    assert cmd[cmd.index("--log-format") + 1] == "date,time,level,msg"
+    assert cmd[cmd.index("--log-format") + 1] == "date,time"
+    assert "--use-json-log=false" in cmd
 
 
 def test_run_uploader_treats_error_level_credential_failure_as_invalid(caplog):

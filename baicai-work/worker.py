@@ -1035,9 +1035,12 @@ def run_uploader(
             "--stats", "15s",               # 15秒刷一次简报
             "--stats-one-line",             # 强制单行，保持观感清爽
             "--log-level", "INFO",
-            # 固定日志格式：错误级别判定依赖 "<日期> <时间> <LEVEL> : <对象>: <消息>"，
-            # 不显式指定时节点上的 RCLONE_LOG_FORMAT / 配置文件可能改变分隔，导致回退成整行匹配。
-            "--log-format", "date,time,level,msg",
+            # 固定日志格式：错误级别判定依赖 "<日期> <时间> <LEVEL> : <对象>: <消息>"。
+            # rclone 的 --log-format 只接受 date/time/microseconds/UTC/longfile/shortfile/pid/nolevel/json
+            # （level 与 msg 不可配置、始终输出），因此这里只固定日期时间前缀，并显式关掉 JSON 日志，
+            # 避免节点上的 RCLONE_USE_JSON_LOG 让级别解析失败、回退成整行匹配。
+            "--log-format", "date,time",
+            "--use-json-log=false",
             "--drive-chunk-size", "128M",
             "--buffer-size", "128M",
             "--drive-stop-on-upload-limit"
