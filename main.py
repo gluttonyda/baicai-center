@@ -10,6 +10,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, List, Literal, Optional
 from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
 
 import httpx
 import pymysql
@@ -115,11 +116,35 @@ def _load_worker_api_url_map() -> dict[str, str]:
     for node_name, api_url in parsed.items():
         if not isinstance(node_name, str) or not isinstance(api_url, str):
             raise RuntimeError("WORKER_API_URL_MAP 中的 node_name 和 api_url 必须为字符串")
+        node_name = node_name.strip()
+        api_url = api_url.strip()
+        if not node_name:
+            raise RuntimeError("WORKER_API_URL_MAP 包含空的 node_name")
         normalized[node_name] = api_url
     return normalized
 
 
 WORKER_API_URL_MAP = _load_worker_api_url_map()
+_REQUIRE_MAP_RAW = os.getenv("REQUIRE_WORKER_API_URL_MAP", "false").strip().lower()
+REQUIRE_WORKER_API_URL_MAP = _REQUIRE_MAP_RAW in ("1", "true", "yes", "on")
+if _REQUIRE_MAP_RAW not in ("", "0", "false", "no", "off", "1", "true", "yes", "on"):
+    # 防御开关不能 fail-open：取值写错时明确告知，而不是静默当成 false。
+    logger.warning(
+        "⚠️ REQUIRE_WORKER_API_URL_MAP 的取值 [%s] 无法识别，按 false 处理；可用值为 true/false。",
+        _REQUIRE_MAP_RAW,
+    )
+
+if not WORKER_API_URL_MAP:
+    if REQUIRE_WORKER_API_URL_MAP:
+        raise RuntimeError(
+            "REQUIRE_WORKER_API_URL_MAP=true 但 WORKER_API_URL_MAP 为空：必须配置 node_name -> api_url 白名单，"
+            "或显式设置 REQUIRE_WORKER_API_URL_MAP=false 关闭该开关"
+        )
+    # 默认保持兼容：空白名单仍可启动，只在启动时提示一次。
+    logger.warning(
+        "⚠️ WORKER_API_URL_MAP 为空：Center 将信任节点上报的 worker_api_url 并向其派发请求；"
+        "生产环境应配置白名单并设置 REQUIRE_WORKER_API_URL_MAP=true。"
+    )
 
 
 def _load_worker_token_map() -> dict[str, str]:
@@ -323,12 +348,46 @@ def validate_api_url(api_url: str) -> str:
         raise ValueError("worker_api_url 必须以 http:// 或 https:// 开头")
     if len(api_url) > 255:
         raise ValueError("worker_api_url 过长")
+    # urlsplit 会静默删除 \t\r\n，先拒绝空白与控制字符，保证校验的就是实际出站地址。
+    if any(char.isspace() or not char.isprintable() for char in api_url):
+        raise ValueError("worker_api_url 不能包含空白或控制字符")
+    try:
+        parts = urlsplit(api_url)
+    except ValueError as exc:
+        raise ValueError("worker_api_url 格式非法") from exc
+    # userinfo 会随请求发出凭据，也容易让人误判实际出站主机。
+    if "@" in parts.netloc:
+        raise ValueError("worker_api_url 不允许包含用户信息（user:password@）")
+    if not parts.hostname:
+        raise ValueError("worker_api_url 缺少主机名")
+    try:
+        port = parts.port
+    except ValueError as exc:
+        raise ValueError("worker_api_url 端口非法") from exc
+    if port is not None:
+        # 旧版 Python 的 port 用 int() 解析，会放过 "+8001" 这类写法，这里只接受纯 ASCII 数字。
+        raw_port = parts.netloc.rpartition(":")[2]
+        if not (raw_port.isascii() and raw_port.isdigit() and 1 <= port <= 65535):
+            raise ValueError("worker_api_url 端口非法")
     return api_url
 
 
-def resolve_worker_api_url(worker_node: str, reported_api_url: str) -> str:
-    validate_api_url(reported_api_url)
+def _validate_worker_api_url_map_entries() -> None:
+    """启动即校验映射地址，避免运行到派发/上报时才以 500 暴露配置错误。"""
+    for node_name, api_url in WORKER_API_URL_MAP.items():
+        try:
+            validate_api_url(api_url)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"WORKER_API_URL_MAP 中节点 [{node_name}] 的地址非法: {exc}"
+            ) from exc
 
+
+_validate_worker_api_url_map_entries()
+
+
+def resolve_worker_api_url(worker_node: str, reported_api_url: str) -> str:
+    # 白名单是权威来源：命中即用映射地址，不再校验可能早已失效的历史上报地址。
     configured_url = WORKER_API_URL_MAP.get(worker_node)
     if configured_url:
         return validate_api_url(configured_url)
@@ -336,7 +395,19 @@ def resolve_worker_api_url(worker_node: str, reported_api_url: str) -> str:
     if WORKER_API_URL_MAP:
         raise HTTPException(status_code=400, detail=f"worker_node [{worker_node}] 未在白名单中注册")
 
-    return reported_api_url
+    return validate_api_url(reported_api_url)
+
+
+def resolve_dispatch_api_url(worker_node: str, registered_api_url: str) -> Optional[str]:
+    """派发前按当前白名单重新解析 worker_registry 中的地址；不可派发时记 warning 并返回 None。"""
+    try:
+        return resolve_worker_api_url(worker_node, registered_api_url)
+    except HTTPException:
+        logger.warning("⏭️ 节点 [%s] 未在 WORKER_API_URL_MAP 白名单中，跳过本次派发。", worker_node)
+    except ValueError as exc:
+        # 不记录原始地址：历史记录里可能带 user:password@。
+        logger.warning("⏭️ 节点 [%s] 的 api_url 不可用（%s），跳过本次派发。", worker_node, exc)
+    return None
 
 
 class ReportFileItem(BaseModel):
@@ -1190,8 +1261,11 @@ def _dispatch_uploader_tasks_locked():
             
             for node in nodes:
                 node_name = node['node_name']
-                target_api_url = node['api_url']
-                
+                # 历史 api_url 可能写入于白名单启用或修改之前，抢占账号前按当前 WORKER_API_URL_MAP 重新解析。
+                target_api_url = resolve_dispatch_api_url(node_name, node['api_url'])
+                if target_api_url is None:
+                    continue
+
                 # 2. 检查该节点的并发数：正在 uploading 的不同账号数
                 cursor.execute("""
                     SELECT COUNT(DISTINCT account_used) as active_count 
@@ -1393,6 +1467,8 @@ def dispatch_cleaner_tasks(force_all=False):
             dispatched_cleaners = set()
             # 当前 worker 只允许有限个 cleaner；同一轮不要反复打同一个节点造成 409/429 风暴。
             cleaner_nodes_touched = set()
+            # 白名单外或地址非法的节点，本轮只处理一次，避免每个 staged 分组都重复查询并刷 warning。
+            skipped_url_nodes = set()
             
             for row in staged_rows:
                 acc_name = row['account_used']
@@ -1404,6 +1480,9 @@ def dispatch_cleaner_tasks(force_all=False):
 
                 if node_name in cleaner_nodes_touched:
                     logger.info("⏭️ 清道夫跳过节点 [%s]：本轮已经尝试过该节点。", node_name)
+                    continue
+
+                if node_name in skipped_url_nodes:
                     continue
                 
                 # 提取账号组前缀 (比如 baicai_1@1 -> baicai_1)
@@ -1477,6 +1556,11 @@ def dispatch_cleaner_tasks(force_all=False):
                 )
                 reg = cursor.fetchone()
                 if reg:
+                    # 与 uploader 一致：获取 cleaner 锁前按当前白名单重新解析历史地址。
+                    target_api_url = resolve_dispatch_api_url(node_name, reg['api_url'])
+                    if target_api_url is None:
+                        skipped_url_nodes.add(node_name)
+                        continue
                     dispatch_id = _new_dispatch_id()
                     try:
                         # 清道夫锁必须通过条件更新获取，避免并发调度器重复派发同一账号。
@@ -1521,7 +1605,7 @@ def dispatch_cleaner_tasks(force_all=False):
                             "source_base_dirs": [task.get("source_base_dir") for task in staged_tasks],
                         })
                         response = httpx.post(
-                            reg['api_url'],
+                            target_api_url,
                             content=raw_body,
                             headers=request_headers,
                             timeout=10.0,

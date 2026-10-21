@@ -2,6 +2,13 @@
 
 本文件记录代码行为和升级要求，不代表已对运行节点执行部署。日期使用 UTC；2026-09-14 一节的整理时间对应北京时间 2026-09-15。
 
+## 2026-10-21 派发地址白名单（Issue #1）
+
+- 派发前按当前 `WORKER_API_URL_MAP` 重新解析目标地址：非空白名单优先于 `worker_registry` 中的历史地址，白名单外节点跳过并记 warning。
+- `validate_api_url` 拒绝 userinfo、空主机名、非法端口、空白/控制字符。
+- 新增 `REQUIRE_WORKER_API_URL_MAP`（默认 false）：为 true 且白名单为空时拒绝启动；映射条目在启动时校验。
+- 升级提示：Worker 的 `WORKER_API_URL` 若带 `user:password@` 或非法端口，`report_files` 会返回 422；升级前可先查 `worker_registry` 中的历史地址。
+
 ## 2026-10-21（依赖拆分与运行时加固）
 
 ### 调整

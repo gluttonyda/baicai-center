@@ -324,7 +324,9 @@ PYTHONPATH=.:baicai-work pytest -q tests/test_mysql_integration.py
 
 本仓库已通过 `.gitignore` 忽略这些内容。公开仓库中只应保留 `.env.example`。
 
-`WORKER_API_URL_MAP` 为空时，Center 会信任节点上报的 `worker_api_url` 并向该地址发起请求。为兼容现有部署，空映射仍允许启动；生产环境应配置完整白名单。
+`WORKER_API_URL_MAP` 为空时，Center 会信任节点上报的 `worker_api_url` 并向该地址发起请求。为兼容现有部署，空映射默认仍允许启动，只在启动日志中警告一次；设置 `REQUIRE_WORKER_API_URL_MAP=true` 后，空映射（包括 `{}`）会直接拒绝启动。生产环境应配置完整白名单并开启该开关。
+
+白名单非空时，uploader 和 cleaner 每次派发前都会按当前映射重新解析 `worker_registry` 中的地址，修改映射后不必等节点重新上报；名单外节点跳过派发并记录 warning。上报的 `worker_api_url` 和映射中的地址都必须是 `http://` 或 `https://`，不允许 `user:password@`、空主机名、非法端口或空白/控制字符；内网主机名、IP 和自定义端口（如 `http://worker-node-1:8001/task/upload`）不受影响。详见 [变更说明](docs/CODE_CHANGES_20261021_dispatch_url.md)。
 
 ## 文档
 

@@ -85,3 +85,87 @@ def test_init_sync_starts_without_api_token():
     result = run_import("init_sync", ROOT, INIT_SYNC_ENV)
 
     assert result.returncode == 0, result.stderr
+
+
+CENTER_ENV = {
+    "API_TOKEN": "test-center-api-token",
+    "DB_HOST": "127.0.0.1",
+    "DB_USER": "test-db-user",
+    "DB_PASSWORD": "test-db-password",
+    "DB_NAME": "test-db-name",
+}
+EMPTY_URL_MAP_WARNING = "WORKER_API_URL_MAP 为空"
+
+
+def run_center_import(extra_env: dict[str, str]) -> subprocess.CompletedProcess:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"WORKER_API_URL_MAP", "REQUIRE_WORKER_API_URL_MAP"}
+    }
+    env.update({**CENTER_ENV, "PYTHONIOENCODING": "utf-8", **extra_env})
+    return subprocess.run(
+        [sys.executable, "-c", "import main"],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        encoding="utf-8",
+        timeout=60,
+    )
+
+
+@pytest.mark.parametrize("url_map", ["", "   ", "{}"])
+def test_center_refuses_empty_worker_api_url_map_when_required(url_map):
+    result = run_center_import({"REQUIRE_WORKER_API_URL_MAP": "true", "WORKER_API_URL_MAP": url_map})
+
+    assert result.returncode != 0
+    assert "RuntimeError" in result.stderr
+    assert "必须配置" in result.stderr
+    assert "REQUIRE_WORKER_API_URL_MAP=false" in result.stderr
+
+
+@pytest.mark.parametrize("require_flag", [None, "false"])
+def test_center_starts_with_empty_worker_api_url_map_and_warns_once(require_flag):
+    extra_env = {"WORKER_API_URL_MAP": ""}
+    if require_flag is not None:
+        extra_env["REQUIRE_WORKER_API_URL_MAP"] = require_flag
+
+    result = run_center_import(extra_env)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr.count(EMPTY_URL_MAP_WARNING) == 1
+
+
+def test_center_starts_when_worker_api_url_map_required_and_configured():
+    result = run_center_import({
+        "REQUIRE_WORKER_API_URL_MAP": "true",
+        "WORKER_API_URL_MAP": '{"worker-node-1":"http://worker-node-1:8001/task/upload"}',
+    })
+
+    assert result.returncode == 0, result.stderr
+    assert EMPTY_URL_MAP_WARNING not in result.stderr
+
+
+def test_center_refuses_empty_map_when_require_flag_has_padding():
+    """防御开关不能因为取值带空格就 fail-open。"""
+    result = run_center_import({"REQUIRE_WORKER_API_URL_MAP": " true ", "WORKER_API_URL_MAP": ""})
+
+    assert result.returncode != 0
+    assert "必须配置" in result.stderr
+
+
+def test_center_warns_on_unrecognized_require_flag_but_starts():
+    result = run_center_import({"REQUIRE_WORKER_API_URL_MAP": "tru", "WORKER_API_URL_MAP": ""})
+
+    assert result.returncode == 0, result.stderr
+    assert "无法识别" in result.stderr
+
+
+def test_center_refuses_invalid_map_entry_at_startup():
+    result = run_center_import({
+        "WORKER_API_URL_MAP": '{"worker-node-1":"ftp://worker-node-1/task/upload"}',
+    })
+
+    assert result.returncode != 0
+    assert "地址非法" in result.stderr
+    assert "worker-node-1" in result.stderr

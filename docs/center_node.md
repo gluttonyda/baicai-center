@@ -97,6 +97,8 @@ Asia/Shanghai
 
 连接池使用 `ping=1`：每次从池中取出连接时都会检测，并替换被服务端超时或 `KILL` 断开的连接。
 
+uploader 和 cleaner 派发前都会用当前 `WORKER_API_URL_MAP` 重新解析 `worker_registry.api_url`，解析发生在抢占账号租约之前。白名单非空时使用映射中的地址，名单外节点跳过；地址不合法（例如带 `user:password@` 或端口非法）的节点同样跳过。两种情况都记录 warning（不输出原始地址），本轮其余节点照常派发。白名单为空时沿用数据库中的地址。
+
 每节点 uploader 并发由 `MAX_CONCURRENT_UPLOADS_PER_WORKER_DAY`、`MAX_CONCURRENT_UPLOADS_PER_WORKER_NIGHT` 控制，默认白天 2 路、夜间 3 路，夜间为北京时间 01:00–10:00。Center 与 Worker 需保持一致；旧单值 `MAX_CONCURRENT_UPLOADS_PER_WORKER` 已被替代。
 
 ## 数据库表
@@ -309,9 +311,9 @@ NODE_TOKEN=CHANGE_ME_WITH_INIT_SCANNER_TOKEN
 
 ## 运维注意
 
-- `WORKER_API_URL_MAP` 非空时，Center 只接受白名单中的 Worker
-- `WORKER_API_URL_MAP` 为空时，Center 信任节点上报的 `worker_api_url` 并向其发起请求。签名节点（以及启用 legacy 时持有共享令牌的调用方）可以借此让 Center 访问任意 HTTP/HTTPS 地址。为兼容现有部署，空映射仍可启动；生产环境应配置完整白名单
-- `worker_api_url` 必须是完整 HTTP/HTTPS URL
+- `WORKER_API_URL_MAP` 非空时，Center 只接受白名单中的 Worker；派发时也按当前映射取地址，修改映射立即生效，名单外的已注册节点不再收到新任务
+- `WORKER_API_URL_MAP` 为空时，Center 信任节点上报的 `worker_api_url` 并向其发起请求。签名节点（以及启用 legacy 时持有共享令牌的调用方）可以借此让 Center 访问任意 HTTP/HTTPS 地址。为兼容现有部署，空映射默认仍可启动，并在启动日志中警告一次；`REQUIRE_WORKER_API_URL_MAP=true` 时空映射（包括 `{}`）拒绝启动。生产环境应配置完整白名单并开启该开关
+- `worker_api_url` 必须是完整 HTTP/HTTPS URL，不允许 `user:password@` 用户信息、空主机名、端口不是 1-65535 的纯数字，或包含空白/控制字符；内网主机名、IP 和自定义端口可以使用。映射中的地址遵守同样规则。不合法的上报返回 422，不合法的历史注册地址在派发时跳过
 - 数据库缺少必填环境变量时，服务会直接启动失败
 - Center 不需要部署 `worker.py` 和 `scanner.py`
 - 公开仓库不要提交 `.env`、数据库备份和运行日志

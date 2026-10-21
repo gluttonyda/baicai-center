@@ -3,6 +3,7 @@ from unittest.mock import MagicMock, patch
 from datetime import datetime, timedelta, timezone
 import httpx
 import json
+import logging
 import os
 import sys
 import threading
@@ -1784,3 +1785,284 @@ def test_get_daily_upload_usage_groups_by_beijing_date(mock_db):
     assert response.json()["rows"][0]["upload_date_bj"] == "2026-06-10"
     sql = mock_db.execute.call_args[0][0]
     assert "GROUP BY upload_date_bj, account_name" in sql
+
+
+class RoutedCursor:
+    """按 SQL 片段应答的游标替身：被跳过的节点不再查询时，fetch 顺序不会错位。"""
+
+    def __init__(self, routes):
+        self.routes = routes
+        self.rowcount = 1
+        self.executed = []
+        self._rows = []
+
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+        self._rows = next((handler(params) for fragment, handler in self.routes if fragment in sql), [])
+
+    def fetchall(self):
+        return list(self._rows)
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+
+def _uploader_dispatch_cursor(registry_rows):
+    """每个节点分到独立账号组和一个待办文件；registry_rows 模拟 worker_registry 中的历史地址。"""
+    accounts = {row["node_name"]: f"baicai_{index}@1" for index, row in enumerate(registry_rows, start=1)}
+    return RoutedCursor([
+        ("SELECT node_name, api_url FROM worker_registry", lambda params: registry_rows),
+        ("COUNT(DISTINCT account_used) as active_count", lambda params: [{"active_count": 0}]),
+        ("AS has_preferred_pending", lambda params: [{"account_name": accounts[params[0]]}]),
+        ("GET_LOCK", lambda params: [{"acquired": 1}]),
+        ("SELECT id, file_path, source_base_dir, size_bytes", lambda params: [{
+            "id": list(accounts).index(params[0]) + 1,
+            "file_path": f"movie/{params[0]}.mkv",
+            "source_base_dir": "/cache/downloads",
+            "size_bytes": 1,
+            "source_mtime": 1.0,
+            "upload_method": "move",
+        }]),
+    ])
+
+
+def _cleaner_dispatch_cursor(registry_urls):
+    """每个节点各有一组配额耗尽的 staged 文件；registry_urls 模拟 worker_registry 中的历史地址。"""
+    staged_rows = [
+        {"account_used": f"baicai_{index}@1", "worker_node": node_name}
+        for index, node_name in enumerate(registry_urls, start=1)
+    ]
+    return RoutedCursor([
+        ("AS staged_count", lambda params: staged_rows),
+        ("AS blocked_uploaders", lambda params: [{"total_uploaders": 1, "blocked_uploaders": 1}]),
+        ("SELECT cleaner_mapping FROM drive_accounts", lambda params: [
+            {"cleaner_mapping": f"{params[0].split('@')[0]}-cleaner@1"}
+        ]),
+        ("SELECT ft.id, ft.file_path, ft.source_base_dir", lambda params: [
+            {"id": 1, "file_path": f"movie/{params[1]}.mkv", "source_base_dir": "/cache/downloads"}
+        ]),
+        ("SELECT api_url FROM worker_registry", lambda params: [{"api_url": registry_urls[params[0]]}]),
+    ])
+
+
+def _run_dispatch_and_collect_targets(dispatch, cursor, url_map):
+    """返回每次出站 POST 的 (目标 URL, payload.worker_node)。"""
+    connection = MagicMock()
+    connection.cursor.return_value.__enter__.return_value = cursor
+    response = MagicMock()
+    response.raise_for_status.return_value = None
+
+    with patch("main.get_db_connection", return_value=connection), \
+         patch.object(main, "WORKER_API_URL_MAP", url_map), \
+         patch.object(main, "CLEANER_DISPATCH_ENABLED", True), \
+         patch("main.httpx.post", return_value=response) as mock_post:
+        dispatch()
+
+    return [(call.args[0], json.loads(call.kwargs["content"])["worker_node"]) for call in mock_post.call_args_list]
+
+
+def _updates_touching_node(cursor, node_name):
+    return [sql for sql, params in cursor.executed if "UPDATE" in sql and params and node_name in params]
+
+
+STALE_REGISTRY_URL = "http://10.0.0.9:8001/task/upload"
+MAPPED_URL = "http://worker-node-1:8001/task/upload"
+
+
+def test_dispatch_uploader_tasks_posts_to_mapped_url_instead_of_stale_registry_url():
+    cursor = _uploader_dispatch_cursor([{"node_name": "worker-node-1", "api_url": STALE_REGISTRY_URL}])
+
+    targets = _run_dispatch_and_collect_targets(main.dispatch_uploader_tasks, cursor, {"worker-node-1": MAPPED_URL})
+
+    assert targets == [(MAPPED_URL, "worker-node-1")]
+
+
+def test_dispatch_uploader_tasks_skips_node_missing_from_url_map(caplog):
+    cursor = _uploader_dispatch_cursor([
+        {"node_name": "legacy-node", "api_url": "http://legacy-node:8001/task/upload"},
+        {"node_name": "worker-node-1", "api_url": STALE_REGISTRY_URL},
+    ])
+
+    with caplog.at_level(logging.WARNING):
+        targets = _run_dispatch_and_collect_targets(main.dispatch_uploader_tasks, cursor, {"worker-node-1": MAPPED_URL})
+
+    assert targets == [(MAPPED_URL, "worker-node-1")]
+    # 跳过发生在抢占账号租约与锁定任务之前，名单外节点不会留下需要回滚的状态。
+    assert _updates_touching_node(cursor, "legacy-node") == []
+    assert any(r.levelno == logging.WARNING and "legacy-node" in r.getMessage() for r in caplog.records)
+
+
+def test_dispatch_uploader_tasks_skips_invalid_registry_url_and_continues(caplog):
+    cursor = _uploader_dispatch_cursor([
+        {"node_name": "bad-port-node", "api_url": "http://bad-port-node:notaport/task/upload"},
+        {"node_name": "userinfo-node", "api_url": "http://admin:s3cret@userinfo-node:8001/task/upload"},
+        {"node_name": "worker-node-1", "api_url": STALE_REGISTRY_URL},
+    ])
+
+    with caplog.at_level(logging.WARNING):
+        targets = _run_dispatch_and_collect_targets(main.dispatch_uploader_tasks, cursor, {})
+
+    assert targets == [(STALE_REGISTRY_URL, "worker-node-1")]
+    assert _updates_touching_node(cursor, "bad-port-node") == []
+    assert _updates_touching_node(cursor, "userinfo-node") == []
+    assert any(r.levelno == logging.WARNING and "bad-port-node" in r.getMessage() for r in caplog.records)
+    assert "s3cret" not in caplog.text
+
+
+def test_dispatch_uploader_tasks_uses_registry_url_when_url_map_empty():
+    cursor = _uploader_dispatch_cursor([{"node_name": "worker-node-1", "api_url": STALE_REGISTRY_URL}])
+
+    targets = _run_dispatch_and_collect_targets(main.dispatch_uploader_tasks, cursor, {})
+
+    assert targets == [(STALE_REGISTRY_URL, "worker-node-1")]
+
+
+def test_dispatch_cleaner_tasks_posts_to_mapped_url_instead_of_stale_registry_url():
+    cursor = _cleaner_dispatch_cursor({"worker-node-1": STALE_REGISTRY_URL})
+
+    targets = _run_dispatch_and_collect_targets(main.dispatch_cleaner_tasks, cursor, {"worker-node-1": MAPPED_URL})
+
+    assert targets == [(MAPPED_URL, "worker-node-1")]
+
+
+def test_dispatch_cleaner_tasks_skips_node_missing_from_url_map(caplog):
+    cursor = _cleaner_dispatch_cursor({
+        "legacy-node": "http://legacy-node:8001/task/upload",
+        "worker-node-1": STALE_REGISTRY_URL,
+    })
+
+    with caplog.at_level(logging.WARNING):
+        targets = _run_dispatch_and_collect_targets(main.dispatch_cleaner_tasks, cursor, {"worker-node-1": MAPPED_URL})
+
+    assert targets == [(MAPPED_URL, "worker-node-1")]
+    # 名单外节点不获取 cleaner 租约、不绑定 staged 批次。
+    assert _updates_touching_node(cursor, "legacy-node") == []
+    assert any(r.levelno == logging.WARNING and "legacy-node" in r.getMessage() for r in caplog.records)
+
+
+def test_dispatch_cleaner_tasks_skips_invalid_registry_url_and_continues(caplog):
+    cursor = _cleaner_dispatch_cursor({
+        "bad-port-node": "http://bad-port-node:notaport/task/upload",
+        "userinfo-node": "http://admin:s3cret@userinfo-node:8001/task/upload",
+        "worker-node-1": STALE_REGISTRY_URL,
+    })
+
+    with caplog.at_level(logging.WARNING):
+        targets = _run_dispatch_and_collect_targets(main.dispatch_cleaner_tasks, cursor, {})
+
+    assert targets == [(STALE_REGISTRY_URL, "worker-node-1")]
+    assert _updates_touching_node(cursor, "bad-port-node") == []
+    assert _updates_touching_node(cursor, "userinfo-node") == []
+    assert any(r.levelno == logging.WARNING and "bad-port-node" in r.getMessage() for r in caplog.records)
+    assert "s3cret" not in caplog.text
+
+
+def test_dispatch_cleaner_tasks_uses_registry_url_when_url_map_empty():
+    cursor = _cleaner_dispatch_cursor({"worker-node-1": STALE_REGISTRY_URL})
+
+    targets = _run_dispatch_and_collect_targets(main.dispatch_cleaner_tasks, cursor, {})
+
+    assert targets == [(STALE_REGISTRY_URL, "worker-node-1")]
+
+
+UNSAFE_API_URLS = [
+    ("http://admin:s3cret@worker-node-1:8001/task/upload", "用户信息"),
+    ("http://admin@worker-node-1:8001/task/upload", "用户信息"),
+    ("http://@worker-node-1:8001/task/upload", "用户信息"),
+    ("http:///task/upload", "主机名"),
+    ("http://:8001/task/upload", "主机名"),
+    ("http://worker-node-1:notaport/task/upload", "端口"),
+    ("http://worker-node-1:99999/task/upload", "端口"),
+    ("http://worker-node-1:0/task/upload", "端口"),
+    ("http://worker-node-1:+8001/task/upload", "端口"),
+    ("ftp://worker-node-1/task/upload", "http:// 或 https://"),
+    ("http://[fd00::1/task/upload", "格式非法"),
+    # urlsplit 会静默删除 \t\n，不先拒绝会让校验对象与实际出站地址不一致。
+    ("http://worker-node-1\n:8001/task/upload", "空白或控制字符"),
+    ("http://worker node/task/upload", "空白或控制字符"),
+]
+
+
+@pytest.mark.parametrize(("api_url", "message"), UNSAFE_API_URLS)
+def test_validate_api_url_rejects_unsafe_urls(api_url, message):
+    with pytest.raises(ValueError, match=message):
+        main.validate_api_url(api_url)
+
+
+@pytest.mark.parametrize(
+    "api_url",
+    [
+        "http://worker-node-1:8001/task/upload",
+        "https://worker-node-1.example.com/task/upload",
+        "http://10.0.0.5:8001/task/upload",
+        "http://172.18.0.3:65535/task/upload",
+        "http://[fd00::1]:8001/task/upload",
+        "http://worker-node-1:8001/task/upload?tag=a@b",
+    ],
+)
+def test_validate_api_url_accepts_internal_hosts_and_custom_ports(api_url):
+    assert main.validate_api_url(api_url) == api_url
+
+
+@pytest.mark.parametrize(
+    ("api_url", "message"),
+    [
+        ("http://admin:s3cret@worker-node-1:8001/task/upload", "用户信息"),
+        ("http:///task/upload", "主机名"),
+        ("http://worker-node-1:notaport/task/upload", "端口"),
+        ("ftp://worker-node-1/task/upload", "http:// 或 https://"),
+    ],
+)
+def test_report_files_rejects_unsafe_worker_api_url(mock_db, api_url, message):
+    payload = {"worker_node": "worker-node-1", "worker_api_url": api_url, "files": ["movie/test1.mkv"]}
+
+    response = client.post("/api/report_files", json=payload, headers=auth_headers())
+
+    assert response.status_code == 422
+    assert any(message in error["msg"] for error in response.json()["detail"])
+    mock_db.execute.assert_not_called()
+
+
+INVALID_STALE_USERINFO_URL = "http://admin:s3cret@worker-node-1:8001/task/upload"
+
+
+def test_dispatch_uploader_tasks_prefers_url_map_over_invalid_stale_url():
+    """白名单是权威来源：历史地址即使不合法，也不应阻止发往映射地址。"""
+    cursor = _uploader_dispatch_cursor([{"node_name": "worker-node-1", "api_url": INVALID_STALE_USERINFO_URL}])
+
+    targets = _run_dispatch_and_collect_targets(main.dispatch_uploader_tasks, cursor, {"worker-node-1": MAPPED_URL})
+
+    assert targets == [(MAPPED_URL, "worker-node-1")]
+
+
+def test_dispatch_cleaner_tasks_prefers_url_map_over_invalid_stale_url():
+    cursor = _cleaner_dispatch_cursor({"worker-node-1": INVALID_STALE_USERINFO_URL})
+
+    targets = _run_dispatch_and_collect_targets(main.dispatch_cleaner_tasks, cursor, {"worker-node-1": MAPPED_URL})
+
+    assert targets == [(MAPPED_URL, "worker-node-1")]
+
+
+def test_load_worker_api_url_map_strips_keys_and_values(monkeypatch):
+    monkeypatch.setenv(
+        "WORKER_API_URL_MAP",
+        '{" worker-node-1 ": " http://worker-node-1:8001/task/upload "}',
+    )
+
+    parsed = main._load_worker_api_url_map()
+
+    assert parsed == {"worker-node-1": "http://worker-node-1:8001/task/upload"}
+
+
+def test_load_worker_api_url_map_rejects_blank_node_name(monkeypatch):
+    monkeypatch.setenv("WORKER_API_URL_MAP", '{"  ": "http://worker-node-1:8001/task/upload"}')
+
+    with pytest.raises(RuntimeError, match="node_name"):
+        main._load_worker_api_url_map()
+
+
+def test_validate_worker_api_url_map_entries_rejects_invalid_entry(monkeypatch):
+    monkeypatch.setattr(main, "WORKER_API_URL_MAP", {"worker-node-1": "ftp://worker-node-1/task/upload"})
+
+    with pytest.raises(RuntimeError, match="worker-node-1"):
+        main._validate_worker_api_url_map_entries()
