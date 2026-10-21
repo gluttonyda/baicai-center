@@ -934,7 +934,6 @@ def run_uploader(
     final_status = "completed"
     successful_files = []
     successful_files_seen: set[str] = set()
-    parsed_transfer_lines = 0
     def mark_success(file_path: str) -> None:
         normalized = file_path.replace("\\", "/")
         if normalized not in successful_files_seen:
@@ -1064,7 +1063,6 @@ def run_uploader(
 
                             transfer = parse_rclone_transfer_line(line)
                             if transfer is not None:
-                                parsed_transfer_lines += 1
                                 file_path, action = transfer
                                 if action == "Skipped":
                                     logger.warning("⏭️ [%s] 远端已存在或被 rclone 跳过: %s", account_name, file_path)
@@ -1117,27 +1115,6 @@ def run_uploader(
     if final_status == "lease_lost":
         return
 
-    # 只有确实出现过逐文件日志、且最终状态正常时才比较差集：
-    # 目标端已存在时 rclone 只输出 "There was nothing to transfer"，此时差集为整批，属正常。
-    if final_status == "completed" and parsed_transfer_lines > 0:
-        missing_set = set(missing_files)
-        unaccounted = sorted(
-            f"{base_dir}/{path}"
-            for base_dir, files in tasks_by_dir.items()
-            for path in files
-            if path not in successful_files_seen
-            and f"{base_dir}/{path}" not in successful_files_seen
-            and path not in missing_set
-            and f"{base_dir}/{path}" not in missing_set
-        )
-        if unaccounted:
-            logger.warning(
-                "⚠️ [%s] %s 个文件既没有成功记录也没有缺失记录，可能未被搬运：%s",
-                account_name,
-                len(unaccounted),
-                ", ".join(unaccounted[:5]) + (" ..." if len(unaccounted) > 5 else ""),
-            )
-
     report_status(account_name, final_status, successful_files, missing_files)
 
 def run_cleaner(
@@ -1159,6 +1136,10 @@ def run_cleaner(
         normalized_path = os.path.normpath(file_path.lstrip("/"))
         if normalized_path in ("", ".") or normalized_path == ".." or normalized_path.startswith("../"):
             logger.warning("🧹 [CLEAN-%s] 拒绝越界清理路径: %r", account_name, file_path)
+            continue
+        if has_unsendable_characters(file_path):
+            # 与 uploader 一致：rclone 会转义控制字符，清单写了也搬不动，显式暴露而不是静默成功。
+            logger.warning("🧹 [CLEAN-%s] 跳过含控制字符的路径：%r", account_name, file_path)
             continue
         if normalized_path not in requested_files_seen:
             requested_files_seen.add(normalized_path)

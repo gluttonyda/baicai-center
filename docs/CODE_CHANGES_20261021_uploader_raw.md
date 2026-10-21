@@ -52,13 +52,9 @@ INFO  : movie/name: Copied tricky.txt: Copied (new)
 - 清单写入的是相对来源根目录的路径；远端复核时则是相对 `<账号>:<目标目录>` 的路径。两者的相对路径相同。
 - `--files-from-raw` 逐行原样匹配，只去掉行尾换行（rclone 按行读取并去掉行尾 `\r`），不做 glob。首尾空白、`#`/`;` 开头都算文件名的一部分。之所以继续拒绝 CR/LF，是因为它们会破坏“一行一个路径”。
 
-### 未记录文件告警
+### 可观测性（本轮未加）
 
-一次 `run_uploader` 结束时，在**确实解析到逐文件日志**（`parsed_transfer_lines > 0`）且最终状态为 `completed` 的前提下，对比「本次清单」与「已成功 + 已缺失」的差集；若仍有文件既无成功也无缺失记录，打一条 warning 并列出前 5 个路径。
-
-- 为什么加这两个前提：目标端已存在同一批文件时，rclone 只输出 `There was nothing to transfer`，没有任何 `<路径>: Copied/Skipped` 行；如果无条件比较差集，会把这批文件全部误报为"可能未被搬运"（重派已搬过的批次时很常见）。
-- 失败状态（`403_quota`、`credential_invalid`、`failed`）不打印该告警：状态本身已经表达了结果，再叠加一条"可能未被搬运"只会制造噪音。
-- 这是可观测性补丁，不改变回报状态；Center 侧「整批标成功」的问题单独跟踪（Issue #7）。
+曾尝试在上传结束时对比「清单」与「成功 + 缺失」的差集并告警，但该判据不可靠：rclone 只对**实际动作**的文件打日志行，目标端已存在且大小/时间一致的文件不会出现任何行。整批已存在（只有 `There was nothing to transfer`）和**部分**已存在两种情况都会让差集等于"未搬运"的文件集合，从而误报。因此本轮删除该告警，改由 Issue #7（Center 不校验 `successful_files`）从根因上解决。
 
 ### 成功回报
 
@@ -123,10 +119,10 @@ INFO  : movie/name: Copied tricky.txt: Copied (new)
 | 改正则，加临时诊断用例 | 同上 | copy/move 通过；lsjson 仍失败。诊断确认 `ModTime='2023-11-14T22:13:20.000000000Z'`，在 Python 3.10.20 下 `ValueError`（诊断用例已删除） |
 | 补 `ModTime` 单测后的全量 | `tests` | 3 failed, 303 passed（ModTime 单测、lsjson 集成用例、临时诊断用例） |
 | 全部完成 | `tests/test_worker_integration.py` | 8 passed |
-| 全部完成 | 全量 `tests` | 305 passed, 4 warnings, 0 skipped |
-| 全部完成 | 全量 `tests`，非 root | 305 passed, 6 warnings（多出的 2 条是非 root 无法写 `.pytest_cache` 的 `PytestCacheWarning`） |
+| 全部完成 | 全量 `tests` | 311 passed, 4 warnings, 0 skipped |
+| 全部完成 | 全量 `tests`，非 root | 311 passed, 6 warnings（多出的 2 条是非 root 无法写 `.pytest_cache` 的 `PytestCacheWarning`） |
 
-基线为 290 个，新增 15 个，合计 305 个。4 条 warning 是 Worker 中原有的 FastAPI `on_event` 弃用提示，与基线相同。说明两点：日志解析单测在实现之前已经写好，但没有单独跑过红灯，正则的问题由上表第二阶段的真实 rclone 输出证明；全角空格用例是在全部转绿之后才加入的回归保护，没有观察过红灯，“它在旧实现下会被裁剪”这一判断依据的是 `strings.TrimSpace` 的语义。
+基线为 290 个，新增 21 个，合计 311 个（含控制字符逐文件跳过、`Moved` 识别、glob 字面量等用例）。4 条 warning 是 Worker 中原有的 FastAPI `on_event` 弃用提示，与基线相同。说明两点：日志解析单测在实现之前已经写好，但没有单独跑过红灯，正则的问题由上表第二阶段的真实 rclone 输出证明；全角空格用例是在全部转绿之后才加入的回归保护，没有观察过红灯，“它在旧实现下会被裁剪”这一判断依据的是 `strings.TrimSpace` 的语义。
 
 本地复现（需要 PATH 中有 rclone 1.65 或更高版本）：
 

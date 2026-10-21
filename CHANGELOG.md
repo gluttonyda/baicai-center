@@ -6,8 +6,8 @@
 
 - uploader 的 `rclone copy`/`rclone move`、`move` 任务本地缺失时的远端复核，以及无调用方的 `detect_cleaner_dest_existing_files`，全部由 `--files-from` 改为 `--files-from-raw`。以 `#`、`;` 开头的相对路径不再被当注释跳过；带首尾空白的路径不再被裁剪，也不会误搬同目录中裁剪后同名的、未列入任务的文件。
 - 成功回报改用 `parse_rclone_transfer_line`：取 `INFO  : ` 之后、行尾 `: <动作>` 之前的全部内容，不再丢失前导空白，也不会在路径含 `: Copied` 时被截断；动作集合补上 `Moved`。
-- 含控制字符（Tab、``、``）的路径**逐文件**回执 `not_found` 并记 warning：rclone 会把这类字符转义成符号（Tab→`␉`），按原名无法搬运。不整批拒绝，避免 Center 每 60 秒重派同一批而卡死账号组。
-- 一次上传结束时，若确实解析到逐文件日志、且仍有文件既无成功也无缺失记录，打 warning 提示可能漏搬；目标端已存在（`There was nothing to transfer`）属于正常，不会误报。
+- 含控制字符（Tab、`\x07`、`\x7f`）的路径**逐文件**回执 `not_found` 并记 warning：rclone 会把这类字符转义成符号（Tab→`␉`），按原名无法搬运。不整批拒绝，避免 Center 每 60 秒重派同一批而卡死账号组。
+- 清理器对含控制字符的路径同样逐文件跳过并记 warning，不再静默回报 `clean_success`。
 - `lsjson` 远端指纹复核兼容 rclone 固定 9 位小数秒的 `ModTime`：此前在 Python 3.10 上解析失败，复核一律不命中（Worker 镜像为 3.11）。
 - 升级提示：需要 rclone 1.52 或更高版本，与 cleaner 相同。升级前已被整批回报 `completed` 但从未上传的文件不会自动补传，需要人工排查（Center 整批标成功的问题见 Issue #7）。
 - 在隔离测试容器（Python 3.10、MySQL 8.4.8、rclone v1.65.0-DEV）中执行全量测试：**311 passed**，非 root 同为 311 passed。细节见 [uploader raw 清单说明](docs/CODE_CHANGES_20261021_uploader_raw.md)。

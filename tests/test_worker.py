@@ -1610,27 +1610,3 @@ def test_run_uploader_skips_control_character_paths_per_file(caplog):
     assert successful == ["movie/a.mkv"]
     assert missing == ["bad\ttab.mkv"]
     assert any("控制字符" in record.getMessage() for record in caplog.records)
-
-
-def test_run_uploader_does_not_warn_when_rclone_reports_nothing_to_transfer(caplog):
-    """目标端已存在时 rclone 只输出 There was nothing to transfer，不能误报"可能未被搬运"。"""
-    import logging
-
-    process, selector_factory = _fake_rclone_harness(
-        ["2026/10/21 10:00:00 INFO  : There was nothing to transfer\n"]
-    )
-
-    with patch("worker.resolve_task_path", side_effect=[("/dir1", "movie/a.mkv"), ("/dir1", "movie/b.mkv")]), \
-         patch("worker.ALLOWED_BASE_DIRS", ["/dir1"]), \
-         patch("worker.subprocess.Popen", return_value=process), \
-         patch("worker.selectors.DefaultSelector", return_value=selector_factory(process)), \
-         patch("worker.tempfile.mkstemp", return_value=(1, "/tmp/a.txt")), \
-         patch("worker.os.fdopen") as mock_fdopen, \
-         patch("worker.os.path.exists", return_value=True), \
-         patch("worker.os.remove"), \
-         patch("worker.report_status"):
-        mock_fdopen.return_value.__enter__.return_value = MagicMock()
-        with caplog.at_level(logging.WARNING):
-            worker.run_uploader("baicai_1@1", ["movie/a.mkv", "movie/b.mkv"], "copy")
-
-    assert not any("既没有成功记录" in record.getMessage() for record in caplog.records)
