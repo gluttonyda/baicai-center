@@ -36,7 +36,7 @@ ALLOWED_BASE_DIRS
 
 `NODE_TOKEN` 必须与 Center 的 `WORKER_TOKEN_MAP[WORKER_NODE_NAME]` 一致。协议 v2 默认使用 HMAC，保留 `ALLOW_LEGACY_BEARER_AUTH=false`、`SCANNER_SEND_BEARER_AUTH=false` 时可以不配置 `API_TOKEN`。任一 legacy 开关为 `true` 时必须配置与 Center 一致的非空 `API_TOKEN`，否则启动失败。
 
-Cleaner 只搬运 Center 下发的本批文件（`rclone move --files-from-raw`），需要 rclone 1.52 或更高版本；中转目录中的其他文件保持不动。
+Uploader（`rclone copy`/`rclone move`）和 Cleaner（`rclone move`）都用 `--files-from-raw` 只搬运 Center 下发的本批文件，需要 rclone 1.52 或更高版本；目录中不在清单里的文件保持不动。清单逐行原样匹配，以 `#`、`;` 开头或带首尾空白的文件名按原名搬运和回报。以前这类文件会被 uploader 静默跳过，升级后会真正上传，`move` 来源中的这类文件会被搬走；升级影响见 [uploader 改用 raw 清单说明](../docs/CODE_CHANGES_20261021_uploader_raw.md#兼容影响)。
 
 确认宿主机有 rclone 配置：
 

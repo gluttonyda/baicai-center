@@ -180,3 +180,114 @@ def test_worker_rclone_clean_moves_only_requested_files():
         for relative_path in unlisted:
             assert (staging_dir / relative_path).exists()
             assert not (dest_dir / relative_path).exists()
+
+
+# `--files-from` 会把 #/; 开头的行当注释、裁剪行首尾空白（含全角空格）；带 ": Copied" 的名字用于检查日志解析不会截断路径。
+SPECIAL_UPLOAD_FILES = [
+    "normal.txt",
+    "#hash.txt",
+    ";semi.txt",
+    " spaced.txt ",
+    "电影/中文 文件.mkv",
+    "电影/全角空格结尾.mkv　",
+    "movie/name: Copied tricky.txt",
+    # --files-from-raw 不做 glob，这些按字面搬运（与旧 --files-from 的 AddFile 行为一致）。
+    "glob*star.txt",
+    "br[ack]et.txt",
+]
+# 同目录下未列入任务的文件；其中两个恰好是带空白的任务名被裁剪后的名字。
+UNLISTED_UPLOAD_FILES = [
+    "unlisted.txt",
+    "spaced.txt",
+    "#unlisted.txt",
+    "电影/未列出.mkv",
+    "电影/全角空格结尾.mkv",
+]
+
+
+@requires_rclone
+@pytest.mark.parametrize("method", ["copy", "move"])
+def test_worker_rclone_uploader_transfers_special_filenames(method):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        source_dir = tmp_path / "source"
+        uploader_root = tmp_path / "uploader"
+        dest_root = tmp_path / "dest"
+        config_path = tmp_path / "rclone.conf"
+        staging_dir = uploader_root / worker.TARGET_REMOTE_DIR
+        for relative_path in [*SPECIAL_UPLOAD_FILES, *UNLISTED_UPLOAD_FILES]:
+            source_file = source_dir / relative_path
+            source_file.parent.mkdir(parents=True, exist_ok=True)
+            source_file.write_text(f"content of {relative_path!r}", encoding="utf-8")
+        uploader_root.mkdir()
+        dest_root.mkdir()
+        write_rclone_config(config_path, uploader_root, dest_root)
+
+        upload_reports = []
+
+        def capture_upload(account, status, successful_files=None, missing_files=None):
+            upload_reports.append((account, status, list(successful_files or []), list(missing_files or [])))
+
+        with patch.dict(os.environ, {"RCLONE_CONFIG": str(config_path)}, clear=False), patch.object(
+            worker, "ALLOWED_BASE_DIRS", [str(source_dir)]
+        ), patch("worker.report_status", side_effect=capture_upload):
+            worker.run_uploader("baicai_1@1", list(SPECIAL_UPLOAD_FILES), method)
+
+        account, status, successful_files, missing_files = upload_reports[-1]
+        assert (account, status, missing_files) == ("baicai_1@1", "completed", [])
+        assert sorted(successful_files) == sorted(SPECIAL_UPLOAD_FILES)
+        for relative_path in SPECIAL_UPLOAD_FILES:
+            staged = staging_dir / relative_path
+            assert staged.exists(), relative_path
+            assert staged.read_text(encoding="utf-8") == f"content of {relative_path!r}"
+            assert (source_dir / relative_path).exists() is (method == "copy"), relative_path
+        for relative_path in UNLISTED_UPLOAD_FILES:
+            assert (source_dir / relative_path).exists(), relative_path
+            assert not (staging_dir / relative_path).exists(), relative_path
+
+
+@requires_rclone
+@pytest.mark.parametrize("with_fingerprint", [False, True], ids=["lsf", "lsjson"])
+def test_worker_rclone_move_recovers_special_filenames_already_on_remote(with_fingerprint):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        source_dir = tmp_path / "source"
+        uploader_root = tmp_path / "uploader"
+        dest_root = tmp_path / "dest"
+        config_path = tmp_path / "rclone.conf"
+        staging_dir = uploader_root / worker.TARGET_REMOTE_DIR
+        remote_mtime = 1_700_000_000
+        # 本地已被上一轮 move 搬走，只在远端存在；未列入任务的远端文件不能被当作补偿成功。
+        for relative_path in [*SPECIAL_UPLOAD_FILES, *UNLISTED_UPLOAD_FILES]:
+            staged = staging_dir / relative_path
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            staged.write_text(f"content of {relative_path!r}", encoding="utf-8")
+            os.utime(staged, (remote_mtime, remote_mtime))
+        source_dir.mkdir()
+        dest_root.mkdir()
+        write_rclone_config(config_path, uploader_root, dest_root)
+        expected_sizes = [(staging_dir / path).stat().st_size for path in SPECIAL_UPLOAD_FILES]
+        expected_mtimes = [float(remote_mtime)] * len(SPECIAL_UPLOAD_FILES)
+
+        upload_reports = []
+
+        def capture_upload(account, status, successful_files=None, missing_files=None):
+            upload_reports.append((account, status, list(successful_files or []), list(missing_files or [])))
+
+        with patch.dict(os.environ, {"RCLONE_CONFIG": str(config_path)}, clear=False), patch.object(
+            worker, "ALLOWED_BASE_DIRS", [str(source_dir)]
+        ), patch("worker.report_status", side_effect=capture_upload):
+            worker.run_uploader(
+                "baicai_1@1",
+                list(SPECIAL_UPLOAD_FILES),
+                "move",
+                None,
+                expected_sizes if with_fingerprint else None,
+                expected_mtimes if with_fingerprint else None,
+            )
+
+        account, status, successful_files, missing_files = upload_reports[-1]
+        assert (account, status, missing_files) == ("baicai_1@1", "completed", [])
+        assert sorted(successful_files) == sorted(SPECIAL_UPLOAD_FILES)
+        for relative_path in [*SPECIAL_UPLOAD_FILES, *UNLISTED_UPLOAD_FILES]:
+            assert (staging_dir / relative_path).exists(), relative_path

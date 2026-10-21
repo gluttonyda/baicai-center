@@ -161,7 +161,11 @@ class TaskPayload(BaseModel):
         for file_path in value:
             if file_path == "":
                 raise ValueError("files 中不能存在空路径")
-            if any(char in file_path for char in ("\x00", "\r", "\n")) or len(file_path) > 1024:
+            # rclone 的 local backend 会把 Tab 等控制字符转义成符号（Tab→U+2409），
+            # 清单里写真实控制字符时文件不会被搬运也不会有日志，因此明确拒绝而不是静默成功。
+            if any(char in file_path for char in ("\x00", "\r", "\n")) or any(
+                ord(char) < 32 or ord(char) == 127 for char in file_path
+            ) or len(file_path) > 1024:
                 raise ValueError("files 中存在非法路径")
             normalized_files.append(file_path)
         return normalized_files
@@ -426,6 +430,20 @@ def is_quota_error(line: str) -> bool:
     return any(marker in normalized for marker in markers)
 
 
+# rclone 文本日志为 "<日期> INFO  : <对象路径>: <动作>"，对象路径原样输出，可能带首尾空格或 ": "。
+# 只去掉 "INFO  : " 后的一个分隔空格，再贪婪匹配到行尾的动作，路径不会被截断或错配。
+RCLONE_TRANSFER_LOG_PATTERN = re.compile(
+    r"INFO\s*: (.*): (Copied(?: \([^)]*\))?|Moved(?: \([^)]*\))?|Skipped|Deleted)$"
+)
+
+
+def parse_rclone_transfer_line(line: str) -> Optional[tuple[str, str]]:
+    match = RCLONE_TRANSFER_LOG_PATTERN.search(line.rstrip("\r\n"))
+    if match is None:
+        return None
+    return match.group(1), match.group(2)
+
+
 def current_beijing_time() -> datetime:
     return datetime.now(BEIJING_TZ)
 
@@ -623,11 +641,12 @@ def detect_remote_existing_files(
                 handle.write(f"{file_path}\n")
 
         verify_fingerprint = expected_sizes is not None or expected_mtimes is not None
+        # 与上传清单一致使用 raw：不裁剪首尾空白、不把 #/; 开头视为注释。
         command = [
             "rclone",
             "lsjson" if verify_fingerprint else "lsf",
             f"{account_name}:{remote_dir or TARGET_REMOTE_DIR}",
-            "--files-from",
+            "--files-from-raw",
             temp_path,
             "--files-only",
             "--recursive",
@@ -678,10 +697,15 @@ def detect_remote_existing_files(
                 remote_mtime = item.get("ModTime")
                 if not isinstance(remote_mtime, str):
                     continue
+                # lsjson 固定输出 9 位小数秒，Python 3.10 的 fromisoformat 只接受 3 或 6 位。
+                remote_mtime = re.sub(
+                    r"\.(\d+)",
+                    lambda fraction: "." + fraction.group(1)[:6].ljust(6, "0"),
+                    remote_mtime.replace("Z", "+00:00"),
+                    count=1,
+                )
                 try:
-                    remote_timestamp = datetime.fromisoformat(
-                        remote_mtime.replace("Z", "+00:00")
-                    ).timestamp()
+                    remote_timestamp = datetime.fromisoformat(remote_mtime).timestamp()
                 except ValueError:
                     continue
                 if abs(remote_timestamp - expected_mtime) > 1.0:
@@ -962,13 +986,14 @@ def run_uploader(
         if not dir_files:
             continue
         
+        # raw 清单逐行原样匹配：路径已拒绝 NUL/CR/LF，首尾空白和 #/; 开头都是文件名的一部分。
         fd, temp_path = tempfile.mkstemp(prefix="bc_up_", suffix=".txt")
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             for fp in dir_files: f.write(f"{fp}\n")
-        
+
         cmd = [
             "rclone", method, base_dir, f"{account_name}:{task_remote_dir}",
-            "--files-from", temp_path, 
+            "--files-from-raw", temp_path,
             "--transfers", str(RCLONE_TRANSFERS),
             "--checkers", str(RCLONE_CHECKERS),
             "--stats", "15s",               # 15秒刷一次简报
@@ -1026,17 +1051,12 @@ def run_uploader(
 
                             print(f"[{account_name}] {line.strip()}", flush=True)
 
-                            if "Copied" in line or "Skipped" in line or "Deleted" in line:
-                                match = re.search(
-                                    r'INFO\s+:\s+(.+?):\s+((?:Copied)(?: \([^)]*\))?|Skipped|Deleted)',
-                                    line,
-                                )
-                                if match:
-                                    file_path = match.group(1)
-                                    action = match.group(2)
-                                    if action == "Skipped":
-                                        logger.warning("⏭️ [%s] 远端已存在或被 rclone 跳过: %s", account_name, file_path)
-                                    mark_success(file_path)
+                            transfer = parse_rclone_transfer_line(line)
+                            if transfer is not None:
+                                file_path, action = transfer
+                                if action == "Skipped":
+                                    logger.warning("⏭️ [%s] 远端已存在或被 rclone 跳过: %s", account_name, file_path)
+                                mark_success(file_path)
 
                             if is_credential_invalid_error(line):
                                 final_status = "credential_invalid"
@@ -1084,6 +1104,19 @@ def run_uploader(
 
     if final_status == "lease_lost":
         return
+
+    # rclone 退出码 0 不代表每个文件都搬成功（Moved 变体、编码转义、日志格式漂移都可能漏记）。
+    if final_status not in ("403_quota", "credential_invalid"):
+        requested_paths = {fp for files in tasks_by_dir.values() for fp in files}
+        unaccounted = sorted(requested_paths - set(successful_files) - set(missing_files))
+        if unaccounted:
+            logger.warning(
+                "⚠️ [%s] %s 个文件既没有成功记录也没有缺失记录，可能未被搬运（rclone 退出码 0）：%s",
+                account_name,
+                len(unaccounted),
+                ", ".join(unaccounted[:5]) + (" ..." if len(unaccounted) > 5 else ""),
+            )
+
     report_status(account_name, final_status, successful_files, missing_files)
 
 def run_cleaner(

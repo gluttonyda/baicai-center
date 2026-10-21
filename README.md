@@ -96,7 +96,7 @@ GET  /api/upload_usage/daily
 2. Scanner 调用 Center 的 `/api/report_files` 上报待搬运文件。
 3. Center 将文件写入 `file_tasks`，初始状态为 `pending`。
 4. Center 定时选择可用 Worker 和可用 uploader 账号。
-5. Worker 收到任务后用 `rclone copy` 或 `rclone move` 执行搬运。
+5. Worker 收到任务后用 `rclone copy` 或 `rclone move` 按本批清单（`--files-from-raw`）执行搬运。
 6. 普通 uploader 成功后，任务进入 `staged`。
 7. Cleaner 账号把本批 `staged` 文件按清单从中转盘移动到最终目标盘（`rclone move --files-from-raw`），中转目录里不在清单中的文件保持不动。
 8. Cleaner 成功后，任务进入 `completed`。
@@ -302,7 +302,7 @@ BAICAI_TEST_MYSQL_DATABASE=baicai_review \
 PYTHONPATH=.:baicai-work pytest -q tests/test_mysql_integration.py
 ```
 
-每个用例都会创建 `review_` 前缀的临时库并在结束后删除，测试账号需要建库和删库权限，不要指向生产实例。`tests/test_worker_integration.py` 的 2 个 rclone 用例会调用 `PATH` 中的真实 `rclone`（建议与生产一致使用 1.65 及以上，只访问本地临时目录）；找不到 `rclone` 时显示为 skipped，`pytest -ra` 会输出安装方式。发布前应在有 rclone 的环境中确认它们是 passed。
+每个用例都会创建 `review_` 前缀的临时库并在结束后删除，测试账号需要建库和删库权限，不要指向生产实例。`tests/test_worker_integration.py` 中的 rclone 用例会调用 `PATH` 中的真实 `rclone`（建议与生产一致使用 1.65 及以上，只访问本地临时目录）；找不到 `rclone` 时显示为 skipped，`pytest -ra` 会输出安装方式。发布前应在有 rclone 的环境中确认它们是 passed。
 
 `scripts/reset_db.py` 会清空任务数据，必须显式确认：`--dry-run` 只读预览，`--yes` 用于非交互环境；不传 `--yes` 时只有在交互终端中输入数据库名才会执行。用法与兼容影响见 [变更说明](docs/CODE_CHANGES_20261021_runtime.md#scriptsreset_dbpy)。
 
