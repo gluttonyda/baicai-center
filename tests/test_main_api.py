@@ -2459,9 +2459,13 @@ def test_dns_resolution_timeout_is_fail_closed(monkeypatch):
     monkeypatch.setattr(main.socket, "getaddrinfo", _hang)
     monkeypatch.setattr(main, "_DNS_RESOLVE_TIMEOUT_SECONDS", 0.2)
     main._DNS_CACHE.clear()
+    started = time.monotonic()
     try:
         with pytest.raises(ValueError):
             main.verify_dispatch_target("http://blackhole.invalid:8001/task/upload")
+        elapsed = time.monotonic() - started
+        # 断言耗时而不只是"抛了异常"：桩会挂 10 秒，没有超时保护时照样会抛 ValueError。
+        assert elapsed < 3.0, f"解析没有被超时打断（耗时 {elapsed:.1f}s）"
     finally:
         release.set()
         main._DNS_CACHE.clear()
