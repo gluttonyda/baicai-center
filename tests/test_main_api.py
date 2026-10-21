@@ -2225,3 +2225,119 @@ def test_report_status_request_rejects_already_present_outside_successful_files(
             successful_files=["movie/a.mkv"],
             already_present_files=["movie/b.mkv"],
         )
+
+
+# ===== 出站地址策略（Issue #1） =====
+
+
+@pytest.mark.parametrize(
+    "api_url",
+    [
+        "http://127.0.0.1:8001/task/upload",
+        "http://[::1]:8001/task/upload",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://0.0.0.0:8001/task/upload",
+        "http://224.0.0.1:8001/task/upload",
+    ],
+)
+def test_verify_dispatch_target_rejects_loopback_and_metadata(api_url):
+    with pytest.raises(ValueError):
+        main.verify_dispatch_target(api_url)
+
+
+def test_verify_dispatch_target_allows_public_address():
+    assert main.verify_dispatch_target("http://8.8.8.8:8001/task/upload")
+
+
+def test_verify_dispatch_target_rejects_dns_resolving_to_metadata(monkeypatch):
+    """DNS 记录被指到元数据地址时必须拒绝（防 DNS 重绑定）。"""
+    monkeypatch.setattr(
+        main.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(2, 1, 6, "", ("169.254.169.254", 8001))],
+    )
+    with pytest.raises(ValueError):
+        main.verify_dispatch_target("http://worker-node-1:8001/task/upload")
+
+
+def test_verify_dispatch_target_allows_private_when_enabled(monkeypatch):
+    monkeypatch.setattr(main, "ALLOW_PRIVATE_WORKER_URLS", True)
+    monkeypatch.setattr(
+        main.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(2, 1, 6, "", ("172.18.0.5", 8001))],
+    )
+    assert main.verify_dispatch_target("http://worker-node-1:8001/task/upload")
+
+
+def test_verify_dispatch_target_rejects_private_when_disabled(monkeypatch):
+    monkeypatch.setattr(main, "ALLOW_PRIVATE_WORKER_URLS", False)
+    monkeypatch.setattr(
+        main.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(2, 1, 6, "", ("172.18.0.5", 8001))],
+    )
+    with pytest.raises(ValueError):
+        main.verify_dispatch_target("http://worker-node-1:8001/task/upload")
+
+
+def test_verify_dispatch_target_honours_allowlisted_host(monkeypatch):
+    monkeypatch.setattr(main, "WORKER_API_ALLOWED_HOSTS", frozenset({"metadata-proxy.local"}))
+    assert main.verify_dispatch_target("http://metadata-proxy.local:8001/task/upload")
+
+
+def test_verify_dispatch_target_rejects_unresolvable_host(monkeypatch):
+    def _boom(*args, **kwargs):
+        raise main.socket.gaierror("no such host")
+
+    monkeypatch.setattr(main.socket, "getaddrinfo", _boom)
+    with pytest.raises(ValueError):
+        main.verify_dispatch_target("http://does-not-exist:8001/task/upload")
+
+
+def test_dispatch_url_resolution_rejects_registered_metadata_address(monkeypatch):
+    """预置在 worker_registry 里的历史地址也要在派发前复核。"""
+    monkeypatch.setattr(main, "WORKER_API_URL_MAP", {})
+    monkeypatch.setattr(main, "TRUST_SELF_REPORTED_WORKER_API_URL", True)
+    assert main.resolve_dispatch_api_url("worker-node-1", "http://169.254.169.254:80/task/upload") is None
+
+
+def test_self_reported_url_rejected_when_trust_disabled(monkeypatch):
+    monkeypatch.setattr(main, "WORKER_API_URL_MAP", {})
+    monkeypatch.setattr(main, "TRUST_SELF_REPORTED_WORKER_API_URL", False)
+    with pytest.raises(main.HTTPException):
+        main.resolve_worker_api_url("worker-node-1", "http://worker-node-1:8001/task/upload")
+
+
+def test_report_files_rejects_cross_node_identity_spoofing(mock_db):
+    """用 A 节点的密钥声明自己是 B 节点：签名校验必须按声明节点取密钥，跨节点身份不能通过。"""
+    token_a = "node-secret-token-aaa"
+    token_b = "node-secret-token-bbb"
+    payload = {
+        "worker_node": "worker-node-2",
+        "worker_api_url": "http://169.254.169.254/task/upload",
+        "protocol_version": 2,
+        "files": [],
+    }
+    raw_body, headers = _signed_report_files_request("worker-node-2", token_a, payload)
+
+    with patch.object(
+        main, "WORKER_TOKEN_MAP", {"worker-node-1": token_a, "worker-node-2": token_b}
+    ), patch("main.time.time", return_value=1700000000):
+        response = client.post("/api/report_files", content=raw_body, headers=headers)
+
+    assert response.status_code == 401
+    assert not any(
+        "worker_registry" in str(call.args[0]) and "UPDATE" in str(call.args[0]).upper()
+        for call in mock_db.execute.call_args_list
+    )
+
+
+def test_non_allowlisted_private_url_rejected_at_dispatch(monkeypatch):
+    """内网开关关闭时，映射里的内网地址也不能派发；打开后可以。"""
+    monkeypatch.setattr(main, "WORKER_API_URL_MAP", {"worker-node-1": "http://172.18.0.5:8001/task/upload"})
+    monkeypatch.setattr(main, "ALLOW_PRIVATE_WORKER_URLS", False)
+    assert main.resolve_dispatch_api_url("worker-node-1", "") is None
+
+    monkeypatch.setattr(main, "ALLOW_PRIVATE_WORKER_URLS", True)
+    assert main.resolve_dispatch_api_url("worker-node-1", "") == "http://172.18.0.5:8001/task/upload"
