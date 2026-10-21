@@ -2156,3 +2156,15 @@ def test_mark_successful_uploads_keeps_concurrency_guards():
 def test_normalize_relative_path_keeps_whitespace():
     """首尾空白属于文件名（Issue #2），归一化不能 strip，否则 CI 无库时也能拦住回归。"""
     assert main.normalize_relative_path(" leading/a.mkv ") == " leading/a.mkv "
+
+
+def test_success_path_sql_contract_placeholder_counts():
+    """SQL 契约：每条语句的 %s 数量必须与实参数一致，避免改参数顺序时静默错位。"""
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [{"id": 7, "file_path": "movie/a.mkv"}]
+
+    main.mark_successful_uploads_by_files(cursor, "baicai_1@1", "staged", ["movie/a.mkv"], "d" * 32)
+
+    for call in cursor.execute.call_args_list:
+        sql, params = call.args[0], call.args[1]
+        assert sql.count("%s") == len(params), sql[:120]
