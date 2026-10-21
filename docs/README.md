@@ -127,7 +127,7 @@ pip install -r requirements.txt -r requirements-dev.txt
 PYTHONPATH=.:baicai-work pytest -q
 ```
 
-`requirements-dev.txt` 只用于开发和测试，Center 镜像不安装。PATH 中没有 `rclone` 时，2 个真实 rclone 用例显示为 skipped。
+`requirements-dev.txt` 只用于开发和测试，Center 镜像不安装。PATH 中没有 `rclone` 时，`tests/test_worker_integration.py` 中需要真实 rclone 的用例显示为 skipped。
 
 真实 MySQL 用例需要设置 `BAICAI_TEST_MYSQL_HOST`、`BAICAI_TEST_MYSQL_USER`、`BAICAI_TEST_MYSQL_PASSWORD`、`BAICAI_TEST_MYSQL_DATABASE`；未设置时会被跳过。说明见 [2026-10-21 调度互斥与鉴权加固说明](CODE_CHANGES_20261021.md#测试)。
 

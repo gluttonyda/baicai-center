@@ -1426,6 +1426,28 @@ def test_remote_probe_preserves_path_whitespace():
     assert existing == {" movie.mkv "}
 
 
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("2026/10/21 10:12:51 INFO  :  spaced.txt : Copied (new)\n", (" spaced.txt ", "Copied (new)")),
+        (
+            "2026/10/21 10:12:51 INFO  : movie/name: Copied tricky.txt: Copied (new)\n",
+            ("movie/name: Copied tricky.txt", "Copied (new)"),
+        ),
+        ("2026/10/21 10:12:51 INFO  : #hash.txt: Deleted\n", ("#hash.txt", "Deleted")),
+        ("2026/10/21 10:12:51 INFO  : ;semi.txt: Copied (new)\n", (";semi.txt", "Copied (new)")),
+        ("2026/10/21 10:12:51 INFO  : 电影/中文 文件.mkv: Copied (new)\n", ("电影/中文 文件.mkv", "Copied (new)")),
+        ("INFO  : movie/a.mkv: Copied (replaced existing)\n", ("movie/a.mkv", "Copied (replaced existing)")),
+        ("INFO  : movie/a.mkv: Skipped\n", ("movie/a.mkv", "Skipped")),
+        ("2026/10/21 10:12:51 INFO  :         125 B / 125 B, 100%, 0 B/s, ETA -\n", None),
+        ("2026/10/21 10:12:51 ERROR : movie/Copied.mkv: Failed to copy: unexpected EOF\n", None),
+        ("2026/10/21 10:12:51 NOTICE: movie/a.mkv: Skipped copy as --dry-run is set (size 1)\n", None),
+    ],
+)
+def test_parse_rclone_transfer_line_keeps_exact_object_path(line, expected):
+    assert worker.parse_rclone_transfer_line(line) == expected
+
+
 def test_remote_probe_requires_matching_expected_fingerprint():
     remote_items = [
         {
@@ -1459,3 +1481,189 @@ def test_remote_probe_requires_matching_expected_fingerprint():
 
     assert existing == {"movie/matching.mkv"}
     assert mock_run.call_args.args[0][1] == "lsjson"
+
+
+def test_remote_probe_accepts_rclone_nanosecond_modtime():
+    # rclone lsjson 的 ModTime 固定 9 位小数秒（实测 v1.65），Python 3.10 的 fromisoformat 不接受。
+    remote_items = [
+        {"Path": "#hash.txt", "Size": 200, "ModTime": "1970-01-01T00:16:40.000000000Z"},
+        {"Path": " spaced.txt ", "Size": 200, "ModTime": "1970-01-01T08:16:40.500000000+08:00"},
+        {"Path": "old.txt", "Size": 200, "ModTime": "1970-01-01T00:16:43.000000000Z"},
+    ]
+    result = MagicMock(returncode=0, stdout=json.dumps(remote_items), stderr="")
+    paths = ["#hash.txt", " spaced.txt ", "old.txt"]
+
+    with patch("worker.subprocess.run", return_value=result) as mock_run:
+        existing = worker.detect_remote_existing_files(
+            "baicai_1@1",
+            paths,
+            {path: 200 for path in paths},
+            {path: 1000.0 for path in paths},
+        )
+
+    assert existing == {"#hash.txt", " spaced.txt "}
+    assert "--files-from-raw" in mock_run.call_args.args[0]
+    assert "--files-from" not in mock_run.call_args.args[0]
+
+
+def test_parse_rclone_transfer_line_recognizes_moved():
+    """alias/local 之间 move 时 rclone 输出 Moved (server-side)，旧动作集合会漏记成"未搬运"。"""
+    assert worker.parse_rclone_transfer_line(
+        "2026/10/21 10:00:00 INFO  : movie/a.mkv: Moved (server-side)"
+    ) == ("movie/a.mkv", "Moved (server-side)")
+
+
+def test_parse_rclone_transfer_line_recognizes_moved_without_suffix():
+    assert worker.parse_rclone_transfer_line(
+        "2026/10/21 10:00:00 INFO  : movie/b.mkv: Moved"
+    ) == ("movie/b.mkv", "Moved")
+
+
+@pytest.mark.parametrize("file_path", ["tab\there.txt", "ctrl\x07char.txt", "del\x7fchar.txt"])
+def test_task_payload_accepts_control_characters_per_file(file_path):
+    """控制字符不再整批拒绝：否则 Center 重派同一批会反复 422，账号组卡死。"""
+    payload = worker.TaskPayload(
+        worker_node=worker.WORKER_NODE_NAME,
+        account_name="baicai_1@1",
+        files=[file_path],
+    )
+
+    assert payload.files == [file_path]
+
+
+def _fake_rclone_harness(lines, returncode=0):
+    class FakeStdout:
+        def __init__(self, items):
+            self._items = list(items)
+
+        def readline(self):
+            return self._items.pop(0) if self._items else ""
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdout = FakeStdout(lines)
+            self.returncode = returncode
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeSelector:
+        def __init__(self, process):
+            self.process = process
+            self.registered = True
+
+        def register(self, fileobj, event):
+            _ = (fileobj, event)
+            self.registered = True
+
+        def unregister(self, fileobj):
+            _ = fileobj
+            self.registered = False
+
+        def select(self, timeout=1.0):
+            _ = timeout
+            if not self.registered:
+                return []
+            return [(SimpleNamespace(fileobj=self.process.stdout), None)]
+
+        def close(self):
+            return None
+
+    return FakeProcess(), FakeSelector
+
+
+def test_run_uploader_skips_control_character_paths_per_file(caplog):
+    """含 Tab 的路径应逐文件回执 not_found，同批其他文件照常上传。"""
+    import logging
+
+    process, selector_factory = _fake_rclone_harness(
+        ["2026/10/21 10:00:00 INFO  : movie/a.mkv: Copied (new)\n"]
+    )
+
+    with patch("worker.resolve_task_path", side_effect=[("/dir1", "movie/a.mkv"), ("/dir1", "bad\ttab.mkv")]), \
+         patch("worker.ALLOWED_BASE_DIRS", ["/dir1"]), \
+         patch("worker.subprocess.Popen", return_value=process), \
+         patch("worker.selectors.DefaultSelector", return_value=selector_factory(process)), \
+         patch("worker.tempfile.mkstemp", return_value=(1, "/tmp/a.txt")), \
+         patch("worker.os.fdopen") as mock_fdopen, \
+         patch("worker.os.path.exists", return_value=True), \
+         patch("worker.os.remove"), \
+         patch("worker.report_status") as mock_report_status:
+        mock_fdopen.return_value.__enter__.return_value = MagicMock()
+        with caplog.at_level(logging.WARNING):
+            worker.run_uploader("baicai_1@1", ["movie/a.mkv", "bad\ttab.mkv"], "copy")
+
+    status, final_status, successful, missing = mock_report_status.call_args.args
+    assert final_status == "completed"
+    assert successful == ["movie/a.mkv"]
+    assert missing == ["bad\ttab.mkv"]
+    assert any("控制字符" in record.getMessage() for record in caplog.records)
+
+
+def test_run_cleaner_skips_control_character_paths_but_still_reports_clean_success(caplog):
+    """控制字符路径被排除出清单、只记 warning；Center 侧仍是整批 clean_success（见文档残留风险 9）。"""
+    import logging
+
+    class FakeStdout:
+        def readline(self):
+            return ""
+
+        def close(self):
+            return None
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdout = FakeStdout()
+            self.returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeSelector:
+        def register(self, fileobj, event):
+            _ = (fileobj, event)
+
+        def unregister(self, fileobj):
+            _ = fileobj
+
+        def select(self, timeout=1.0):
+            _ = timeout
+            return []
+
+        def close(self):
+            return None
+
+    process = FakeProcess()
+    with patch("worker.resolve_cleaner_destination_remote", return_value="baicai-big:staging"), \
+         patch("worker.subprocess.Popen", return_value=process), \
+         patch("worker.selectors.DefaultSelector", return_value=FakeSelector()), \
+         patch("worker.report_status") as mock_report_status:
+        with caplog.at_level(logging.WARNING):
+            worker.run_cleaner("baicai-1@1-3", "baicai-big", ["movie/a.mkv", "bad\ttab.mkv"])
+
+    assert mock_report_status.call_args.args[:2] == ("baicai-1@1-3", "clean_success")
+    assert any("控制字符" in record.getMessage() for record in caplog.records)

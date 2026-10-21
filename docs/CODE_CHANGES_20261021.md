@@ -112,7 +112,7 @@ cleaner 的真实 rclone 测试位于 `tests/test_worker_integration.py`，需�
 1. `WORKER_API_URL_MAP` 为空时 Center 信任上报地址（SSRF 风险）。建议后续二选一：启动时在空映射下打印醒目警告并提供 `REQUIRE_WORKER_API_URL_MAP` 开关；或对上报地址做主机白名单或私网段限制。需要先确认现网所有节点都已配置映射。
 2. uploader 调度跨进程互斥只是“抢不到就跳过”，没有选主；cleaner 调度没有加入该互斥。
 3. 即时触发与上一轮触发线程收尾之间仍有很小的窗口，新的触发可能被合并后丢失，由下一次定时调度兜底（60 秒内）。
-4. uploader 仍使用 `--files-from`，rclone 会去除行首尾空白并跳过以 `#`/`;` 开头的行。这类文件名在上传阶段就可能被跳过，建议后续单独评估改为 `--files-from-raw`。
+4. ~~uploader 仍使用 `--files-from`，rclone 会去除行首尾空白并跳过以 `#`/`;` 开头的行。~~ 已在 Issue #2 修复（uploader 改用 `--files-from-raw`），见 [uploader 改用 raw 清单说明](CODE_CHANGES_20261021_uploader_raw.md)。
 5. `report_new_files` 使用 `VALUES()`，它在 MySQL 8.0.20 起已被标记为弃用（8.4.8 仍可用）。未来升级 MySQL 前应改为行别名语法，并保持赋值顺序。
 6. cleaner 改为精确搬运后，数据库中没有记录、只留在中转目录的文件需要人工处理。
 7. FastAPI `on_event` 弃用警告仍未处理。

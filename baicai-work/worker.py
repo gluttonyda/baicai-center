@@ -426,6 +426,25 @@ def is_quota_error(line: str) -> bool:
     return any(marker in normalized for marker in markers)
 
 
+# rclone 文本日志为 "<日期> INFO  : <对象路径>: <动作>"，对象路径原样输出，可能带首尾空格或 ": "。
+# 只去掉 "INFO  : " 后的一个分隔空格，再贪婪匹配到行尾的动作，路径不会被截断或错配。
+RCLONE_TRANSFER_LOG_PATTERN = re.compile(
+    r"INFO\s*: (.*): (Copied(?: \([^)]*\))?|Moved(?: \([^)]*\))?|Skipped|Deleted)$"
+)
+
+
+def has_unsendable_characters(file_path: str) -> bool:
+    """rclone 的 local backend 会把 C0/DEL 转义成可见符号（Tab→U+2409），原样清单匹配不到。"""
+    return any(ord(char) < 32 or ord(char) == 127 for char in file_path)
+
+
+def parse_rclone_transfer_line(line: str) -> Optional[tuple[str, str]]:
+    match = RCLONE_TRANSFER_LOG_PATTERN.search(line.rstrip("\r\n"))
+    if match is None:
+        return None
+    return match.group(1), match.group(2)
+
+
 def current_beijing_time() -> datetime:
     return datetime.now(BEIJING_TZ)
 
@@ -623,11 +642,12 @@ def detect_remote_existing_files(
                 handle.write(f"{file_path}\n")
 
         verify_fingerprint = expected_sizes is not None or expected_mtimes is not None
+        # 与上传清单一致使用 raw：不裁剪首尾空白、不把 #/; 开头视为注释。
         command = [
             "rclone",
             "lsjson" if verify_fingerprint else "lsf",
             f"{account_name}:{remote_dir or TARGET_REMOTE_DIR}",
-            "--files-from",
+            "--files-from-raw",
             temp_path,
             "--files-only",
             "--recursive",
@@ -678,10 +698,15 @@ def detect_remote_existing_files(
                 remote_mtime = item.get("ModTime")
                 if not isinstance(remote_mtime, str):
                     continue
+                # lsjson 固定输出 9 位小数秒，Python 3.10 的 fromisoformat 只接受 3 或 6 位。
+                remote_mtime = re.sub(
+                    r"\.(\d+)",
+                    lambda fraction: "." + fraction.group(1)[:6].ljust(6, "0"),
+                    remote_mtime.replace("Z", "+00:00"),
+                    count=1,
+                )
                 try:
-                    remote_timestamp = datetime.fromisoformat(
-                        remote_mtime.replace("Z", "+00:00")
-                    ).timestamp()
+                    remote_timestamp = datetime.fromisoformat(remote_mtime).timestamp()
                 except ValueError:
                     continue
                 if abs(remote_timestamp - expected_mtime) > 1.0:
@@ -712,7 +737,7 @@ def detect_cleaner_dest_existing_files(
                 "rclone",
                 "lsf",
                 f"{dest_name}:{target_remote_dir}",
-                "--files-from",
+                "--files-from-raw",
                 files_from_path,
                 "--files-only",
                 "--recursive",
@@ -856,6 +881,15 @@ def run_uploader(
         if resolved is None:
             missing_files.append(file_path)
             continue
+        if has_unsendable_characters(file_path):
+            # 不整批拒绝：否则 Center 每 60 秒重派同一批并再次 422，账号组会永远卡住。
+            logger.warning(
+                "⚠️ 账号 [%s] 跳过含控制字符的路径（rclone 会转义字符，无法按原名搬运）：%r",
+                account_name,
+                file_path,
+            )
+            missing_files.append(file_path)
+            continue
         base_dir, clean_path = resolved
         expected_size = (
             expected_sizes[file_index]
@@ -962,13 +996,14 @@ def run_uploader(
         if not dir_files:
             continue
         
+        # raw 清单逐行原样匹配：路径已拒绝 NUL/CR/LF，首尾空白和 #/; 开头都是文件名的一部分。
         fd, temp_path = tempfile.mkstemp(prefix="bc_up_", suffix=".txt")
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             for fp in dir_files: f.write(f"{fp}\n")
-        
+
         cmd = [
             "rclone", method, base_dir, f"{account_name}:{task_remote_dir}",
-            "--files-from", temp_path, 
+            "--files-from-raw", temp_path,
             "--transfers", str(RCLONE_TRANSFERS),
             "--checkers", str(RCLONE_CHECKERS),
             "--stats", "15s",               # 15秒刷一次简报
@@ -1026,17 +1061,12 @@ def run_uploader(
 
                             print(f"[{account_name}] {line.strip()}", flush=True)
 
-                            if "Copied" in line or "Skipped" in line or "Deleted" in line:
-                                match = re.search(
-                                    r'INFO\s+:\s+(.+?):\s+((?:Copied)(?: \([^)]*\))?|Skipped|Deleted)',
-                                    line,
-                                )
-                                if match:
-                                    file_path = match.group(1)
-                                    action = match.group(2)
-                                    if action == "Skipped":
-                                        logger.warning("⏭️ [%s] 远端已存在或被 rclone 跳过: %s", account_name, file_path)
-                                    mark_success(file_path)
+                            transfer = parse_rclone_transfer_line(line)
+                            if transfer is not None:
+                                file_path, action = transfer
+                                if action == "Skipped":
+                                    logger.warning("⏭️ [%s] 远端已存在或被 rclone 跳过: %s", account_name, file_path)
+                                mark_success(file_path)
 
                             if is_credential_invalid_error(line):
                                 final_status = "credential_invalid"
@@ -1084,6 +1114,7 @@ def run_uploader(
 
     if final_status == "lease_lost":
         return
+
     report_status(account_name, final_status, successful_files, missing_files)
 
 def run_cleaner(
@@ -1105,6 +1136,11 @@ def run_cleaner(
         normalized_path = os.path.normpath(file_path.lstrip("/"))
         if normalized_path in ("", ".") or normalized_path == ".." or normalized_path.startswith("../"):
             logger.warning("🧹 [CLEAN-%s] 拒绝越界清理路径: %r", account_name, file_path)
+            continue
+        if has_unsendable_characters(file_path):
+            # rclone 会转义控制字符，清单写了也搬不动；这里只做本地可见化（warning），
+            # Center 侧仍然按整批 clean_success 收尾，被跳过的文件会留在中转盘（见文档残留风险）。
+            logger.warning("🧹 [CLEAN-%s] 跳过含控制字符的路径：%r", account_name, file_path)
             continue
         if normalized_path not in requested_files_seen:
             requested_files_seen.add(normalized_path)
