@@ -896,3 +896,43 @@ def test_mark_successful_uploads_dedupes_by_normalized_value(schema_db):
     assert statuses["movie/w.mkv"] == "staged"
     assert statuses["/movie/w.mkv"] == "uploading"
     assert events == 1
+
+
+def test_already_present_files_are_marked_but_not_billed(schema_db):
+    """远端已存在的文件要记成功，但不得计入当日上传用量（Issue #15）。"""
+    with schema_db.cursor() as cursor:
+        cursor.execute(
+            "INSERT INTO worker_registry (node_name, api_url, protocol_version, last_active) "
+            "VALUES ('worker-node-1', 'http://worker-node-1:8001/task/upload', 2, UTC_TIMESTAMP())"
+        )
+        cursor.execute(
+            "INSERT INTO drive_accounts (account_name, role, is_active) VALUES ('baicai_1@1', 'uploader', 1)"
+        )
+        for path, size in (("movie/skipped.mkv", 1000), ("movie/uploaded.mkv", 2000)):
+            cursor.execute(
+                "INSERT INTO file_tasks (file_path, status, worker_node, account_used, size_bytes, dispatch_id) "
+                "VALUES (%s, 'uploading', 'worker-node-1', 'baicai_1@1', %s, NULL)",
+                (path, size),
+            )
+
+    with schema_db.cursor() as cursor:
+        main.mark_successful_uploads_by_files(
+            cursor,
+            "baicai_1@1",
+            "staged",
+            ["movie/skipped.mkv", "movie/uploaded.mkv"],
+            None,
+            already_present_files=["movie/skipped.mkv"],
+        )
+
+    with schema_db.cursor() as cursor:
+        cursor.execute("SELECT file_path, status FROM file_tasks ORDER BY file_path")
+        statuses = {row["file_path"]: row["status"] for row in cursor.fetchall()}
+        cursor.execute(
+            "SELECT t.file_path, e.size_bytes FROM account_upload_events e "
+            "JOIN file_tasks t ON t.id = e.file_task_id"
+        )
+        billed = {row["file_path"]: row["size_bytes"] for row in cursor.fetchall()}
+
+    assert statuses == {"movie/skipped.mkv": "staged", "movie/uploaded.mkv": "staged"}
+    assert billed == {"movie/uploaded.mkv": 2000}

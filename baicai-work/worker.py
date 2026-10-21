@@ -51,6 +51,10 @@ TASK_JOURNAL_DB_PATH = os.getenv(
 TASK_JOURNAL_RETENTION_DAYS = max(1, int(os.getenv("TASK_JOURNAL_RETENTION_DAYS", "30")))
 REPORT_RETRY_INTERVAL_SECONDS = max(1, int(os.getenv("REPORT_RETRY_INTERVAL_SECONDS", "30")))
 REMOTE_PROBE_TIMEOUT_SECONDS = max(1, int(os.getenv("REMOTE_PROBE_TIMEOUT_SECONDS", "120")))
+
+# 远端 mtime 比对容差：drive 后端的 ModTimePrecision 是毫秒，rclone 自己判 "unchanged" 也按这个精度。
+# 窗口放大会把「大小相同、mtime 相差不到 1 秒、内容其实已改」的文件当成已存在而跳过上传。
+REMOTE_MTIME_TOLERANCE_SECONDS = 0.001
 NODE_SIGNATURE_MAX_AGE_SECONDS = max(30, int(os.getenv("NODE_SIGNATURE_MAX_AGE_SECONDS", "300")))
 RCLONE_BWLIMIT = os.getenv("RCLONE_BWLIMIT", "").strip()
 RCLONE_TRANSFERS = max(1, int(os.getenv("RCLONE_TRANSFERS", "4")))
@@ -589,6 +593,7 @@ def report_status(
     status: str,
     successful_files: Optional[List[str]] = None,
     missing_files: Optional[List[str]] = None,
+    already_present_files: Optional[List[str]] = None,
 ):
     task_payload = current_task_payload.get()
     dispatch_id = task_payload.dispatch_id if task_payload is not None else None
@@ -599,6 +604,8 @@ def report_status(
         "status": status,
         "successful_files": successful_files or [],
         "missing_files": missing_files or [],
+        # 远端已存在、本次没有真正传输的文件：Center 据此排除用量计费。
+        "already_present_files": already_present_files or [],
     }
     # 先持久化最终回执再发送；中心不可达或进程重启后仍可补送上传结果。
     if status in FINAL_STATUSES:
@@ -658,6 +665,8 @@ def skip_already_uploaded_files(
     remote_dir: Optional[str],
     mark_success,
     delete_local: bool = False,
+    dispatch_id: Optional[str] = None,
+    already_present_out: Optional[List[str]] = None,
 ) -> List[str]:
     """把远端已存在且指纹一致的文件记为成功，返回仍需要上传的文件。
 
@@ -669,6 +678,9 @@ def skip_already_uploaded_files(
     """
     if not file_paths:
         return []
+    if is_dispatch_cancelled(dispatch_id):
+        # 租约已丢：既不复检也不删本地，交给上层按 lease_lost 收尾。
+        return file_paths
 
     size_by_path: dict[str, int] = {}
     mtime_by_path: dict[str, float] = {}
@@ -676,26 +688,41 @@ def skip_already_uploaded_files(
         try:
             stat_result = os.stat(os.path.join(base_dir, file_path))
         except OSError:
-            # 本地读不到（并发被删/权限），交给后面的上传流程按缺失处理。
+            # 本地读不到（并发被删/权限）：没有指纹就不能证明远端那份是同内容，
+            # 一律留在待传清单里交给 rclone 判定（它会报 no such file，走可见的 failed）。
             continue
         size_by_path[file_path] = stat_result.st_size
         mtime_by_path[file_path] = stat_result.st_mtime
 
+    # 只复检有本地指纹的路径：detect_remote_existing_files 对缺失的期望值会跳过比对，
+    # 若把无指纹的路径也送进去，等于只按文件名放行。
+    probe_paths = [path for path in file_paths if path in size_by_path]
+    if not probe_paths:
+        return file_paths
+
     already_present = detect_remote_existing_files(
         account_name,
-        file_paths,
-        size_by_path,
-        mtime_by_path,
+        probe_paths,
+        {path: size_by_path[path] for path in probe_paths},
+        {path: mtime_by_path[path] for path in probe_paths},
         remote_dir,
     )
+    # 只认我们真正问过的路径：探测结果里出现清单外的名字时不记账。
+    already_present &= set(probe_paths)
     if not already_present:
         return file_paths
+
+    if already_present_out is not None:
+        already_present_out.extend(sorted(already_present))
 
     for file_path in already_present:
         mark_success(file_path)
         # move 语义要求搬完后本地消失；rclone 对这种"跳过"的文件不会删本地，
         # 留着会被扫描器当成新文件重新入库，形成慢速重复上传。
         if delete_local:
+            if is_dispatch_cancelled(dispatch_id):
+                logger.warning("🛑 [%s] 租约已丢失，跳过删除本地文件 %s", account_name, file_path)
+                continue
             local_path = os.path.realpath(os.path.join(base_dir, file_path))
             base_real = os.path.realpath(base_dir)
             if os.path.commonpath([local_path, base_real]) != base_real:
@@ -797,7 +824,7 @@ def detect_remote_existing_files(
                     remote_timestamp = datetime.fromisoformat(remote_mtime).timestamp()
                 except ValueError:
                     continue
-                if abs(remote_timestamp - expected_mtime) > 1.0:
+                if abs(remote_timestamp - expected_mtime) > REMOTE_MTIME_TOLERANCE_SECONDS:
                     continue
             matched_files.add(file_path)
         return matched_files
@@ -1021,6 +1048,8 @@ def run_uploader(
 
     final_status = "completed"
     successful_files = []
+    # 远端已存在、未真正传输的文件（不参与 Center 的用量计费）。
+    already_present_files: List[str] = []
     successful_files_seen: set[str] = set()
     def mark_success(file_path: str) -> None:
         normalized = file_path.replace("\\", "/")
@@ -1057,6 +1086,7 @@ def run_uploader(
         if recovered_remote_files:
             for file_path in recovered_remote_files:
                 mark_success(file_path)
+            already_present_files.extend(sorted(recovered_remote_files))
             missing_files = [fp for fp in missing_files if fp not in recovered_remote_files]
             logger.warning(
                 "🩹 账号 [%s] 有 %s 个本地缺失文件已在远端存在，按已成功搬运恢复记录。",
@@ -1069,7 +1099,7 @@ def run_uploader(
     if total_found == 0:
         if successful_files and not missing_files:
             logger.warning("🩹 账号 [%s] 本地文件已不存在，但远端已命中全部文件，按完成处理。", account_name)
-            report_status(account_name, "completed", successful_files, [])
+            report_status(account_name, "completed", successful_files, [], already_present_files=already_present_files)
         else:
             logger.warning("⚠️ 警告：Center 发来的所有文件在本地均不存在！任务将回退等待人工排查。")
             report_status(
@@ -1094,6 +1124,8 @@ def run_uploader(
             task_remote_dir,
             mark_success,
             delete_local=(method == "move"),
+            dispatch_id=dispatch_id,
+            already_present_out=already_present_files,
         )
         if not dir_files:
             continue
@@ -1226,7 +1258,13 @@ def run_uploader(
     if final_status == "lease_lost":
         return
 
-    report_status(account_name, final_status, successful_files, missing_files)
+    report_status(
+        account_name,
+        final_status,
+        successful_files,
+        missing_files,
+        already_present_files=already_present_files,
+    )
 
 def run_cleaner(
     account_name: str,

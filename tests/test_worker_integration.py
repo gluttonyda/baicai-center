@@ -113,7 +113,7 @@ def test_worker_rclone_upload_and_clean_round_trip():
         with patch.dict(os.environ, {"RCLONE_CONFIG": str(config_path)}, clear=False), patch.object(worker, "ALLOWED_BASE_DIRS", [str(source_dir)]):
             upload_reports = []
 
-            def capture_upload(account, status, successful_files=None, missing_files=None):
+            def capture_upload(account, status, successful_files=None, missing_files=None, already_present_files=None):
                 upload_reports.append((account, status, successful_files or [], missing_files or []))
 
             with patch("worker.report_status", side_effect=capture_upload):
@@ -125,7 +125,7 @@ def test_worker_rclone_upload_and_clean_round_trip():
 
             clean_reports = []
 
-            def capture_clean(account, status, successful_files=None, missing_files=None):
+            def capture_clean(account, status, successful_files=None, missing_files=None, already_present_files=None):
                 clean_reports.append((account, status, successful_files or [], missing_files or []))
 
             with patch(
@@ -160,7 +160,7 @@ def test_worker_rclone_clean_moves_only_requested_files():
 
         clean_reports = []
 
-        def capture_clean(account, status, successful_files=None, missing_files=None):
+        def capture_clean(account, status, successful_files=None, missing_files=None, already_present_files=None):
             clean_reports.append((account, status))
 
         with patch.dict(os.environ, {"RCLONE_CONFIG": str(config_path)}, clear=False), patch(
@@ -225,7 +225,7 @@ def test_worker_rclone_uploader_transfers_special_filenames(method):
 
         upload_reports = []
 
-        def capture_upload(account, status, successful_files=None, missing_files=None):
+        def capture_upload(account, status, successful_files=None, missing_files=None, already_present_files=None):
             upload_reports.append((account, status, list(successful_files or []), list(missing_files or [])))
 
         with patch.dict(os.environ, {"RCLONE_CONFIG": str(config_path)}, clear=False), patch.object(
@@ -271,7 +271,7 @@ def test_worker_rclone_move_recovers_special_filenames_already_on_remote(with_fi
 
         upload_reports = []
 
-        def capture_upload(account, status, successful_files=None, missing_files=None):
+        def capture_upload(account, status, successful_files=None, missing_files=None, already_present_files=None):
             upload_reports.append((account, status, list(successful_files or []), list(missing_files or [])))
 
         with patch.dict(os.environ, {"RCLONE_CONFIG": str(config_path)}, clear=False), patch.object(
@@ -322,13 +322,21 @@ def test_worker_rclone_marks_already_present_file_as_success():
         with patch.dict(os.environ, {"RCLONE_CONFIG": str(config_path)}, clear=False), patch.object(worker, "ALLOWED_BASE_DIRS", [str(source_dir)]):
             reports = []
 
-            def capture(account, status, successful_files=None, missing_files=None):
-                reports.append((account, status, successful_files or [], missing_files or []))
+            def capture(account, status, successful_files=None, missing_files=None, already_present_files=None):
+                reports.append(
+                    (account, status, successful_files or [], missing_files or [], already_present_files or [])
+                )
 
             with patch("worker.report_status", side_effect=capture):
                 worker.run_uploader("baicai_1@1", ["movie/sample.txt"], "copy")
 
-            assert reports[-1] == ("baicai_1@1", "completed", ["movie/sample.txt"], [])
+            assert reports[-1] == (
+                "baicai_1@1",
+                "completed",
+                ["movie/sample.txt"],
+                [],
+                ["movie/sample.txt"],
+            )
             # 未被重新上传：mtime 保持不变（重传会写入新的 mtime）。
             assert staged_file.stat().st_mtime_ns == staged_mtime
 
@@ -357,13 +365,15 @@ def test_worker_rclone_still_uploads_when_remote_copy_differs():
         with patch.dict(os.environ, {"RCLONE_CONFIG": str(config_path)}, clear=False), patch.object(worker, "ALLOWED_BASE_DIRS", [str(source_dir)]):
             reports = []
 
-            def capture(account, status, successful_files=None, missing_files=None):
-                reports.append((account, status, successful_files or [], missing_files or []))
+            def capture(account, status, successful_files=None, missing_files=None, already_present_files=None):
+                reports.append(
+                    (account, status, successful_files or [], missing_files or [], already_present_files or [])
+                )
 
             with patch("worker.report_status", side_effect=capture):
                 worker.run_uploader("baicai_1@1", ["movie/sample.txt"], "copy")
 
-            assert reports[-1] == ("baicai_1@1", "completed", ["movie/sample.txt"], [])
+            assert reports[-1] == ("baicai_1@1", "completed", ["movie/sample.txt"], [], [])
             assert staged_file.read_text(encoding="utf-8") == "hello worker"
 
 
@@ -391,12 +401,20 @@ def test_worker_rclone_move_deletes_local_when_remote_already_present():
         with patch.dict(os.environ, {"RCLONE_CONFIG": str(config_path)}, clear=False), patch.object(worker, "ALLOWED_BASE_DIRS", [str(source_dir)]):
             reports = []
 
-            def capture(account, status, successful_files=None, missing_files=None):
-                reports.append((account, status, successful_files or [], missing_files or []))
+            def capture(account, status, successful_files=None, missing_files=None, already_present_files=None):
+                reports.append(
+                    (account, status, successful_files or [], missing_files or [], already_present_files or [])
+                )
 
             with patch("worker.report_status", side_effect=capture):
                 worker.run_uploader("baicai_1@1", ["movie/sample.txt"], "move")
 
-            assert reports[-1] == ("baicai_1@1", "completed", ["movie/sample.txt"], [])
+            assert reports[-1] == (
+                "baicai_1@1",
+                "completed",
+                ["movie/sample.txt"],
+                [],
+                ["movie/sample.txt"],
+            )
             assert not source_file.exists()
             assert staged_file.exists()

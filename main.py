@@ -494,6 +494,8 @@ class ReportStatusRequest(BaseModel):
     worker_node: Optional[str] = Field(default=None, min_length=1, max_length=128)
     successful_files: List[str] = Field(default_factory=list)
     missing_files: List[str] = Field(default_factory=list)
+    # 远端已存在、本次没有真正传输的文件：标记成功但不计用量。
+    already_present_files: List[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_dispatch_identity(self):
@@ -529,6 +531,11 @@ class ReportStatusRequest(BaseModel):
                 raise ValueError("successful_files 中存在非法路径")
             normalized_files.append(file_path)
         return normalized_files
+
+    @field_validator("already_present_files")
+    @classmethod
+    def validate_already_present_files(cls, value: List[str]) -> List[str]:
+        return cls.validate_successful_files(value)
 
     @field_validator("missing_files")
     @classmethod
@@ -960,10 +967,18 @@ def mark_successful_uploads_by_files(
     target_status: str,
     file_paths: List[str],
     dispatch_id: Optional[str] = None,
+    already_present_files: Optional[List[str]] = None,
 ):
     if not file_paths:
         return
     task_ids = resolve_successful_task_ids(cursor, account_name, file_paths, dispatch_id)
+    # 已存在的文件没有真正传输，不能计入当日上传用量：在 UPDATE 之前解析它们的 id
+    # （UPDATE 之后这些行已不是 uploading，再查就查不到了）。
+    non_billable_ids = set()
+    if already_present_files:
+        non_billable_ids = set(
+            resolve_successful_task_ids(cursor, account_name, already_present_files, dispatch_id)
+        )
     updated_ids: List[int] = []
     for start in range(0, len(task_ids), MAX_SUCCESSFUL_FILES):
         chunk = task_ids[start:start + MAX_SUCCESSFUL_FILES]
@@ -996,7 +1011,8 @@ def mark_successful_uploads_by_files(
             chunk + [account_name, target_status],
         )
         updated_ids.extend(int(row["id"]) for row in (cursor.fetchall() or []))
-    record_upload_usage_events_for_task_ids(cursor, account_name, updated_ids, dispatch_id)
+    billable_ids = [task_id for task_id in updated_ids if task_id not in non_billable_ids]
+    record_upload_usage_events_for_task_ids(cursor, account_name, billable_ids, dispatch_id)
 
 
 def count_uploading_tasks(cursor, account_name: str, dispatch_id: Optional[str]) -> int:
@@ -2370,6 +2386,7 @@ def receive_worker_report(req: ReportStatusRequest, node_auth: dict[str, Optiona
                         success_target_status,
                         req.successful_files,
                         req.dispatch_id,
+                        already_present_files=req.already_present_files,
                     )
 
             if req.missing_files:

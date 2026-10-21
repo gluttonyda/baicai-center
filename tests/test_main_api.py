@@ -2168,3 +2168,22 @@ def test_success_path_sql_contract_placeholder_counts():
     for call in cursor.execute.call_args_list:
         sql, params = call.args[0], call.args[1]
         assert sql.count("%s") == len(params), sql[:120]
+
+
+def test_report_status_request_validates_already_present_files():
+    from fastapi import HTTPException  # noqa: F401  （仅用于说明返回码约定）
+
+    accepted = main.ReportStatusRequest(
+        account_name="baicai_1@1",
+        status="completed",
+        successful_files=["movie/a.mkv"],
+        already_present_files=["movie/a.mkv"],
+    )
+    assert accepted.already_present_files == ["movie/a.mkv"]
+
+    with pytest.raises(ValueError):
+        main.ReportStatusRequest(
+            account_name="baicai_1@1",
+            status="completed",
+            already_present_files=["bad\npath.mkv"],
+        )
