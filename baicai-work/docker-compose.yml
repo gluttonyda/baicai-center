@@ -16,7 +16,8 @@ services:
       - /data/rclone-cache:/data/rclone-cache
       - ./logs/rclone:/data/logs/rclone
       - ./runtime:/opt/baicai-worker/runtime
-      # 生产节点的 rclone 1.65 支持现有带 @ 的 remote 名；镜像 apt 1.60 不支持。
+      # 镜像已内置 rclone 1.65.2（支持带 @ 的 remote 名）；这个挂载是可选的：
+      # 只有想固定用宿主机特定版本时才需要，新节点可以直接删掉。
       - /usr/bin/rclone:/usr/bin/rclone:ro
       - /root/.config/rclone:/root/.config/rclone
 
