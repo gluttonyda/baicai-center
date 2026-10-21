@@ -936,3 +936,46 @@ def test_already_present_files_are_marked_but_not_billed(schema_db):
 
     assert statuses == {"movie/skipped.mkv": "staged", "movie/uploaded.mkv": "staged"}
     assert billed == {"movie/uploaded.mkv": 2000}
+
+
+def test_heartbeat_then_final_report_bills_only_transferred_files(schema_db):
+    """心跳（uploading）先结算、终态再结算同一批：用量事件只能记真正传输的文件，重复回执不重复计费。"""
+    with schema_db.cursor() as cursor:
+        cursor.execute(
+            "INSERT INTO worker_registry (node_name, api_url, protocol_version, last_active) "
+            "VALUES ('worker-node-1', 'http://worker-node-1:8001/task/upload', 2, UTC_TIMESTAMP())"
+        )
+        cursor.execute(
+            "INSERT INTO drive_accounts (account_name, role, is_active) VALUES ('baicai_1@1', 'uploader', 1)"
+        )
+        for path, size in (("movie/skipped.mkv", 1000), ("movie/uploaded.mkv", 2000)):
+            cursor.execute(
+                "INSERT INTO file_tasks (file_path, status, worker_node, account_used, size_bytes, dispatch_id) "
+                "VALUES (%s, 'uploading', 'worker-node-1', 'baicai_1@1', %s, NULL)",
+                (path, size),
+            )
+
+    paths = ["movie/skipped.mkv", "movie/uploaded.mkv"]
+    for target_status in ("staged", "staged", "completed"):
+        with schema_db.cursor() as cursor:
+            main.mark_successful_uploads_by_files(
+                cursor,
+                "baicai_1@1",
+                target_status,
+                paths,
+                None,
+                already_present_files=["movie/skipped.mkv"],
+            )
+
+    with schema_db.cursor() as cursor:
+        cursor.execute(
+            "SELECT t.file_path, e.size_bytes FROM account_upload_events e "
+            "JOIN file_tasks t ON t.id = e.file_task_id"
+        )
+        billed = {row["file_path"]: row["size_bytes"] for row in cursor.fetchall()}
+        cursor.execute("SELECT status FROM file_tasks")
+        statuses = [row["status"] for row in cursor.fetchall()]
+
+    assert billed == {"movie/uploaded.mkv": 2000}
+    # 心跳已把行结算成 staged；终态回执因为 status='uploading' 兜底而成为 no-op（幂等、不重复计费）。
+    assert statuses == ["staged", "staged"]

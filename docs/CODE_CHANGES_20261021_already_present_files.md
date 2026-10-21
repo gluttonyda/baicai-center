@@ -46,10 +46,12 @@ PR #10 之后 `completed` 回执只按 `successful_files` 标记成功，因此�
   - `test_worker_rclone_marks_already_present_file_as_success`：远端已有同内容同 mtime 的文件 → 回执 `completed`、`successful_files` 与 `already_present_files` 均含该文件、远端 mtime 不变（未被重传）。**修复前该用例失败**（`successful_files` 为空）。
   - `test_worker_rclone_still_uploads_when_remote_copy_differs`：远端同名但大小不同 → 照常上传并覆盖内容，`already_present_files` 为空。
   - `test_worker_rclone_move_deletes_local_when_remote_already_present`：move 模式 → 记成功、本地副本被删除、远端文件保留。
-- 真库用例：`test_already_present_files_are_marked_but_not_billed` —— 两行都变 `staged`，但用量事件只记真正传输的那个文件。
+- 真库用例：
+  - `test_already_present_files_are_marked_but_not_billed` —— 两行都变 `staged`，但用量事件只记真正传输的那个文件。
+  - `test_heartbeat_then_final_report_bills_only_transferred_files` —— 先发心跳、重复心跳、再发终态：用量事件始终只有真正传输的文件；重复回执因为 `status='uploading'` 兜底成为 no-op（幂等）。
 - 单元用例：只复检有指纹的路径、无指纹时完全不探测、租约丢失时不探测、越界路径拒绝删除、move 模式删本地、mtime 偏差 0.5 秒不再算同一文件、回执载荷包含 `already_present_files`、心跳透传该字段、请求模型校验该字段且拒绝非子集输入、`run_uploader` 接线（move 语义 + 回执汇总）。
 - `tests/test_worker.py` 增加 autouse fixture，把 `skip_already_uploaded_files` 置为直通，避免新增的 lsjson 复核打乱这些用例对 rclone 调用序列的断言；复核逻辑本身由上面的真 rclone 用例覆盖。
-- 全量：**356 passed, 0 skipped, 4 warnings**（真 MySQL 8.4.8 + 真实 rclone v1.65.0）；非 root 同为 356 passed。
+- 全量：**357 passed, 0 skipped, 4 warnings**（真 MySQL 8.4.8 + 真实 rclone v1.65.0）；非 root 同为 356 passed。
 
 ## 残留
 
@@ -58,3 +60,4 @@ PR #10 之后 `completed` 回执只按 `successful_files` 标记成功，因此�
 - 若整批文件都被结算、且 `successful_files` 之外的路径确实不存在，仍走既有的 `not_found`/租约回收路径。
 - drive 不区分大小写，远端 `lsjson` 返回存储侧真实大小写；若本地写法大小写不同，则不会命中复检，交回 rclone 仍会被 INFO 级静默跳过、行继续滞留到租约超时。这是既有的大小写/排序规则差异（DB 侧 `utf8mb4_unicode_ci` 不区分大小写），未在本 PR 处理。
 - 额外的一次 list 调用会略微增加 drive API 压力；`is_quota_error` 把 `userRateLimitExceeded` 与真正的配额/上传上限一视同仁（命中即封号 24h）是既有问题，本改动只是增加了触发面。
+- `mark_successful_uploads_by_files` 对 `successful_files` 与 `already_present_files` 各解析一次 id：若同一归一化路径在库中存在多行（`a.mkv` 与 `./a.mkv`）且上报又是第三种写法，两次解析可能落到不同 id，导致极少数真正传输的文件少计一次用量。方向是保守的（只会少计、不会多计），暂不改。
