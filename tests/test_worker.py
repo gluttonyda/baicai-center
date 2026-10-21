@@ -1667,3 +1667,107 @@ def test_run_cleaner_skips_control_character_paths_but_still_reports_clean_succe
 
     assert mock_report_status.call_args.args[:2] == ("baicai-1@1-3", "clean_success")
     assert any("控制字符" in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "2026/10/21 10:00:00 INFO  : token expired.mkv: Copied (new)",
+        "2026/10/21 10:00:00 INFO  : upload limit 2024.mkv: Copied (new)",
+        "2026/10/21 10:00:00 INFO  : There was nothing to transfer",
+        "2026/10/21 10:00:00 DEBUG : skipped: quota exceeded marker in path",
+    ],
+)
+def test_success_lines_do_not_trigger_error_detection(line):
+    """INFO/DEBUG 行（含带关键字的文件名）不应被判定成配额或凭据错误。"""
+    assert worker.is_error_level_line(line) is False
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "2026/10/21 10:00:00 ERROR : film.mkv: googleapi: Error 403: User rate limit exceeded",
+        "2026/10/21 10:00:00 ERROR : film.mkv: oauth2: cannot fetch token: invalid_grant",
+        "2026/10/21 10:00:00 NOTICE: pacer: low level retry 1/10 (error googleapi: Error 403: quota exceeded)",
+    ],
+)
+def test_error_level_lines_still_trigger_detection(line):
+    assert worker.is_error_level_line(line) is True
+
+
+def test_unknown_level_falls_back_to_legacy_matching():
+    """无法识别级别时保留旧行为，避免漏判。"""
+    assert worker.is_error_level_line("token expired") is True
+
+
+def test_run_uploader_does_not_disable_account_for_filename_with_token_expired(caplog):
+    """文件名含 token expired 的成功行不能触发 credential_invalid（否则误封账号）。"""
+    import logging
+
+    class FakeStdout:
+        def __init__(self, lines):
+            self._lines = list(lines)
+
+        def readline(self):
+            return self._lines.pop(0) if self._lines else ""
+
+    class FakeProcess:
+        def __init__(self, lines):
+            self.stdout = FakeStdout(lines)
+            self.returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeSelector:
+        def __init__(self, process):
+            self.process = process
+            self.registered = True
+
+        def register(self, fileobj, event):
+            _ = (fileobj, event)
+            self.registered = True
+
+        def unregister(self, fileobj):
+            _ = fileobj
+            self.registered = False
+
+        def select(self, timeout=1.0):
+            _ = timeout
+            if not self.registered:
+                return []
+            return [(SimpleNamespace(fileobj=self.process.stdout), None)]
+
+        def close(self):
+            return None
+
+    process = FakeProcess(["2026/10/21 10:00:00 INFO  : token expired.mkv: Copied (new)\n"])
+
+    with patch("worker.resolve_task_path", return_value=("/dir1", "token expired.mkv")), \
+         patch("worker.ALLOWED_BASE_DIRS", ["/dir1"]), \
+         patch("worker.subprocess.Popen", return_value=process), \
+         patch("worker.selectors.DefaultSelector", return_value=FakeSelector(process)), \
+         patch("worker.tempfile.mkstemp", return_value=(1, "/tmp/a.txt")), \
+         patch("worker.os.fdopen") as mock_fdopen, \
+         patch("worker.os.path.exists", return_value=True), \
+         patch("worker.os.remove"), \
+         patch("worker.report_status") as mock_report_status:
+        mock_fdopen.return_value.__enter__.return_value = MagicMock()
+        with caplog.at_level(logging.WARNING):
+            worker.run_uploader("baicai_1@1", ["token expired.mkv"], "copy")
+
+    assert mock_report_status.call_args.args[1] == "completed"
+    assert "token expired.mkv" in mock_report_status.call_args.args[2]
+    assert not any("凭据失效" in record.getMessage() for record in caplog.records)
