@@ -62,6 +62,8 @@ docker compose up -d --build
 /root/.config/rclone -> /root/.config/rclone
 ```
 
+镜像内置的 `/usr/local/bin/rclone` 在 `PATH` 上优先，`/usr/bin/rclone` 挂载实际不会被使用，可以删掉。
+
 Scanner 会扫描：
 
 - `/data/links`：`copy`

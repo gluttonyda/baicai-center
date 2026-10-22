@@ -49,4 +49,4 @@ Failed to create file system for "baicai_1@1:": config name contains invalid cha
 ## 残留
 
 - rclone 版本升级仍需人工改 `ARG`：刻意不做“自动取最新”，避免同一镜像 tag 在不同时间构建出不同二进制。
-- 镜像内 rclone 与宿主机 rclone 现在可能版本不同（镜像 1.65.2、宿主机 1.65.0-DEV）：只要保留宿主机挂载，以宿主机为准；两种版本都支持 `--files-from-raw` 与含 `@` 的 remote。
+- 镜像内 rclone 与宿主机 rclone 现在可能版本不同（镜像 1.65.2、宿主机 1.65.0-DEV）：**以镜像为准**。镜像装在 `/usr/local/bin/rclone`，宿主机挂载落在 `/usr/bin/rclone`，Worker 按 `PATH` 调用而 `/usr/local/bin` 在前，所以保留宿主机挂载也不会改用宿主机版本。（2026-10-22 更正：此前这里写的是“以宿主机为准”，与实际相反。）两种版本都支持 `--files-from-raw` 与含 `@` 的 remote。

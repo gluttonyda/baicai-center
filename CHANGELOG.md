@@ -2,6 +2,15 @@
 
 本文件记录代码行为和升级要求，不代表已对运行节点执行部署。日期使用 UTC；2026-09-14 一节的整理时间对应北京时间 2026-09-15。
 
+## 2026-10-22 Tailnet 精确豁免与 uploader 维护开关（Issue #22、#23、#24）
+
+- 新增 `WORKER_API_TAILNET_IPS`（默认空，行为不变）：精确批准 `WORKER_API_URL_MAP` 里的 TailIP 字面量通过 CGNAT 检查；启动时与 map 双向核对，非法即拒绝启动；`100.100.100.0/24` 永不豁免，其余拒绝规则不变。
+- 新增 `UPLOADER_DISPATCH_ENABLED`（默认 true）：false 时定时与即时 uploader 调度在拿锁、连库之前返回，含超时回收；不影响已在执行的轮次、回执写库与 Worker 启动恢复。取值不合法时拒绝启动。
+- `WORKER_API_URL_MAP` 启动校验（JSON 解析、逐项地址校验）与 TailIP 一致性报错只给序号，不再回显节点名、URL，也不再把带原值的解析器异常挂在异常链上（Issue #24）。
+- 新增 `deploy/hold/`：只创建、不启动的维护期安装助手与 override 模板。安装助手只做维护升级（每个服务恰好一个旧容器），并逐服务保证 Worker 接单并发与旧容器逐字一致。
+- 文档更正：Worker 镜像内 `/usr/local/bin/rclone` 在 PATH 上优先于宿主机挂载的 `/usr/bin/rclone`。
+- 细节见 [Tailnet 精确豁免与维护开关](docs/CODE_CHANGES_20261022_tailnet_release_guard.md)。
+
 ## 2026-10-21 按文件标记上传成功（Issue #7）
 
 - `status=completed` 的回执不再无条件整批置成功：协议 v2 节点只标记 `successful_files` 里的任务，未列出的任务保持 `uploading`，由既有租约超时机制回退重派并重试；`protocol_version < 2` 或未知节点保留整批语义并打 warning。

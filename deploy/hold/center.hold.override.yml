@@ -1,0 +1,18 @@
+# 维护期 hold override（Center）。只配合 deploy/hold/hold_install.py 创建容器，不用于启动。
+# 叠加在现场 docker-compose.yml 之后（-f docker-compose.yml -f <本文件>），.env 与基础 compose 一字不改。
+# 只覆盖：镜像、build、重启策略、两个派发开关、TailIP 白名单；端口、网络、env_file、健康检查保持现场配置。
+#
+# 必填变量（在执行安装助手的 shell 环境里 export；缺任一项 compose 求值即失败）：
+#   BAICAI_HOLD_CENTER_IMAGE            唯一固定的本地 tag，如 baicai-center:<R12>-<release-id>-arm64
+#   BAICAI_HOLD_WORKER_API_URL_MAP      精确的 {"<节点名>":"http://<TailIP>:8001/task/upload", ...}
+#   BAICAI_HOLD_WORKER_API_TAILNET_IPS  与 map 一一对应的规范 TailIP，逗号分隔
+services:
+  baicai-api:
+    image: ${BAICAI_HOLD_CENTER_IMAGE:?set a pinned local image tag}
+    build: !reset null
+    restart: "no"
+    environment:
+      UPLOADER_DISPATCH_ENABLED: "false"
+      CLEANER_DISPATCH_ENABLED: "false"
+      WORKER_API_URL_MAP: ${BAICAI_HOLD_WORKER_API_URL_MAP:?set the exact tailnet URL map}
+      WORKER_API_TAILNET_IPS: ${BAICAI_HOLD_WORKER_API_TAILNET_IPS:?set the approved TailIPs}

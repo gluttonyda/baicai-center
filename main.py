@@ -80,6 +80,27 @@ for config_name, config_value in (
         raise RuntimeError(f"{config_name} 配置非法")
 
 
+def _strict_env_flag(name: str, default: bool) -> bool:
+    """未设置或为空时取 default；只认 true/false/1/0/yes/no/on/off，其它取值拒绝启动，报错不回显原值。"""
+    raw = os.getenv(name, "").strip().lower()
+    if raw == "":
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    raise RuntimeError(f"{name} 取值无法识别；只接受 true/false、1/0、yes/no、on/off")
+
+
+# 维护开关：false 时冻结下一轮起的 uploader 调度（含超时回收），见 dispatch_uploader_tasks。
+UPLOADER_DISPATCH_ENABLED = _strict_env_flag("UPLOADER_DISPATCH_ENABLED", True)
+if not UPLOADER_DISPATCH_ENABLED:
+    logger.warning(
+        "⏸️ UPLOADER_DISPATCH_ENABLED=false：定时与即时 uploader 调度都不再执行（含超时回收）；"
+        "已在执行的轮次、回执写库与 Worker 启动恢复不受影响。"
+    )
+
+
 def upload_remote_dir_for_account(account_name: str) -> str:
     if account_name.startswith("baicai_big@"):
         return LEGACY_DIRECT_REMOTE_DIR
@@ -109,7 +130,8 @@ def _load_worker_api_url_map() -> dict[str, str]:
     try:
         parsed = json.loads(raw_value)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"WORKER_API_URL_MAP 不是合法 JSON: {exc}") from exc
+        # 只报位置；from None：JSONDecodeError.doc 带整段原始 map，不能挂在异常链上。
+        raise RuntimeError(f"WORKER_API_URL_MAP 不是合法 JSON（第 {exc.lineno} 行第 {exc.colno} 列）") from None
 
     if not isinstance(parsed, dict):
         raise RuntimeError("WORKER_API_URL_MAP 必须是 node_name -> api_url 的 JSON 对象")
@@ -207,6 +229,9 @@ _ALWAYS_BLOCKED_NETWORKS = tuple(
         "2001:db8::/32",   # 文档用段
     )
 )
+_CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
+# Tailscale 自身的服务地址（MagicDNS 100.100.100.100 等）与阿里云元数据 100.100.100.200 所在段：永不豁免。
+_NEVER_EXEMPT_CGNAT = ipaddress.ip_network("100.100.100.0/24")
 
 
 _DNS_CACHE: dict[tuple[str, int], tuple[float, list]] = {}
@@ -249,8 +274,14 @@ def _getaddrinfo_with_timeout(host: str, port: int) -> list:
 def _blocked_address_reason(
     ip: "ipaddress.IPv4Address | ipaddress.IPv6Address",
     allow_private: bool = False,
+    tailnet_approved: bool = False,
 ) -> Optional[str]:
-    """按地址类型给出拒绝原因；返回 None 表示允许。"""
+    """按地址类型给出拒绝原因；返回 None 表示允许。
+
+    tailnet_approved 只跳过 CGNAT 这一条规则，其余硬拒规则照常检查；v4-mapped 写法与
+    100.100.100.0/24 无论如何都不豁免。
+    """
+    written_as_ipv4 = isinstance(ip, ipaddress.IPv4Address)
     # ::ffff:100.100.100.200 这类 IPv4 映射地址要先还原成 IPv4 再分类，
     # 否则 Python ≥3.13 会把它当成普通 IPv6 地址（不同版本行为还不一致）。
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
@@ -258,6 +289,13 @@ def _blocked_address_reason(
 
     for network in _ALWAYS_BLOCKED_NETWORKS:
         if ip.version == network.version and ip in network:
+            if (
+                network == _CGNAT_NETWORK
+                and tailnet_approved
+                and written_as_ipv4
+                and ip not in _NEVER_EXEMPT_CGNAT
+            ):
+                continue
             return f"禁用网段 {network}"
 
     if ip.is_loopback:
@@ -275,7 +313,9 @@ def _blocked_address_reason(
     return None
 
 
-def _verify_resolved_addresses(host: str, port: int, allow_private: bool = False) -> None:
+def _verify_resolved_addresses(
+    host: str, port: int, allow_private: bool = False, tailnet_approved: bool = False
+) -> None:
     # allowlist 只放开"内网/非全局"这一档：回环、链路本地、元数据、组播、保留段一律仍然拒绝，
     # 否则运维写一个宽松主机名就等于整体关掉策略。
     host_allowlisted = host.lower() in WORKER_API_ALLOWED_HOSTS
@@ -284,7 +324,10 @@ def _verify_resolved_addresses(host: str, port: int, allow_private: bool = False
     except ValueError:
         literal = None
     if literal is not None:
-        reason = _blocked_address_reason(literal, allow_private=allow_private or host_allowlisted)
+        # TailIP 豁免只给 IP 字面量分支；DNS 分支解析到同一地址也不放行。
+        reason = _blocked_address_reason(
+            literal, allow_private=allow_private or host_allowlisted, tailnet_approved=tailnet_approved
+        )
         if reason:
             raise ValueError(f"worker_api_url 指向被拒绝的地址（{reason}）")
         return
@@ -311,19 +354,28 @@ def _verify_resolved_addresses(host: str, port: int, allow_private: bool = False
             raise ValueError(f"worker_api_url 解析到被拒绝的地址（{reason}）")
 
 
-def verify_dispatch_target(api_url: str, trusted_source: bool = False) -> str:
+def verify_dispatch_target(api_url: str, trusted_source: bool = False, *, worker_node: Optional[str] = None) -> str:
     """派发前复核出站目标的实际地址。
 
     worker_api_url 会来自节点自报或历史注册记录，格式合法不等于可以连：这里在每次派发前
     （重新）解析主机名并拒绝回环/链路本地/元数据等地址，同时降低 DNS 记录被事后改写的风险。
     解析与真正建立连接之间仍有 TOCTOU 窗口，彻底缓解需要出口网络策略配合。
+
+    CGNAT 豁免只给这一种情况：白名单来源、带节点名、完整 URL 等于该节点的映射地址，
+    且主机串本身就是 WORKER_API_TAILNET_IPS 里的规范 IPv4。
     """
     parts = urlsplit(api_url)
     host = parts.hostname
     if not host:
         raise ValueError("worker_api_url 缺少主机名")
     port = parts.port or (443 if parts.scheme == "https" else 80)
-    _verify_resolved_addresses(host, port, allow_private=trusted_source)
+    tailnet_approved = (
+        trusted_source
+        and worker_node is not None
+        and api_url == WORKER_API_URL_MAP.get(worker_node)
+        and host in WORKER_API_TAILNET_IPS
+    )
+    _verify_resolved_addresses(host, port, allow_private=trusted_source, tailnet_approved=tailnet_approved)
     return api_url
 
 
@@ -531,10 +583,11 @@ def validate_api_url(api_url: str) -> str:
     # urlsplit 会静默删除 \t\r\n，先拒绝空白与控制字符，保证校验的就是实际出站地址。
     if any(char.isspace() or not char.isprintable() for char in api_url):
         raise ValueError("worker_api_url 不能包含空白或控制字符")
+    # 下面两处 from None：urlsplit/port 的原始异常文本带 netloc 或端口原串，不能随异常链打印。
     try:
         parts = urlsplit(api_url)
-    except ValueError as exc:
-        raise ValueError("worker_api_url 格式非法") from exc
+    except ValueError:
+        raise ValueError("worker_api_url 格式非法") from None
     # userinfo 会随请求发出凭据，也容易让人误判实际出站主机。
     if "@" in parts.netloc:
         raise ValueError("worker_api_url 不允许包含用户信息（user:password@）")
@@ -542,8 +595,8 @@ def validate_api_url(api_url: str) -> str:
         raise ValueError("worker_api_url 缺少主机名")
     try:
         port = parts.port
-    except ValueError as exc:
-        raise ValueError("worker_api_url 端口非法") from exc
+    except ValueError:
+        raise ValueError("worker_api_url 端口非法") from None
     if port is not None:
         # 旧版 Python 的 port 用 int() 解析，会放过 "+8001" 这类写法，这里只接受纯 ASCII 数字。
         raw_port = parts.netloc.rpartition(":")[2]
@@ -553,17 +606,78 @@ def validate_api_url(api_url: str) -> str:
 
 
 def _validate_worker_api_url_map_entries() -> None:
-    """启动即校验映射地址，避免运行到派发/上报时才以 500 暴露配置错误。"""
-    for node_name, api_url in WORKER_API_URL_MAP.items():
+    """启动即校验映射地址，避免运行到派发/上报时才以 500 暴露配置错误。
+
+    报错只给序号：节点名与 URL 都可能误填了凭据，形如普通节点名也证明不了不是。
+    validate_api_url 的报错文本是固定句子，不含取值。
+    """
+    for index, api_url in enumerate(WORKER_API_URL_MAP.values(), start=1):
         try:
             validate_api_url(api_url)
         except ValueError as exc:
-            raise RuntimeError(
-                f"WORKER_API_URL_MAP 中节点 [{node_name}] 的地址非法: {exc}"
-            ) from exc
+            raise RuntimeError(f"WORKER_API_URL_MAP 第 {index} 项的地址非法: {exc}") from None
 
 
 _validate_worker_api_url_map_entries()
+
+
+def _load_worker_api_tailnet_ips(raw_value: str, url_map: dict[str, str]) -> frozenset[str]:
+    """解析 WORKER_API_TAILNET_IPS：精确的规范 CGNAT IPv4，并与 WORKER_API_URL_MAP 双向一致。
+
+    只用 urlsplit/ipaddress，不做 DNS；报错只给序号，不回显取值、节点名或 URL（可能误填了凭据）。
+    为空时保持旧行为，不给已有映射增加新约束。
+    """
+    if not raw_value.strip():
+        return frozenset()
+
+    approved: set[str] = set()
+    for index, token in enumerate(raw_value.split(","), start=1):
+        token = token.strip()
+        if not token:
+            raise RuntimeError(f"WORKER_API_TAILNET_IPS 第 {index} 项为空")
+        try:
+            address = ipaddress.IPv4Address(token)
+        except ValueError:
+            # from None：ipaddress 的异常文本带原值，不能随 traceback 打出来。
+            raise RuntimeError(f"WORKER_API_TAILNET_IPS 第 {index} 项不是规范的 IPv4 地址") from None
+        if str(address) != token or address not in _CGNAT_NETWORK or address in _NEVER_EXEMPT_CGNAT:
+            raise RuntimeError(
+                f"WORKER_API_TAILNET_IPS 第 {index} 项必须是 CGNAT 段内的规范 IPv4，且不在 Tailscale 服务地址段内"
+            )
+        approved.add(token)
+
+    if not url_map:
+        raise RuntimeError("WORKER_API_TAILNET_IPS 已启用，但 WORKER_API_URL_MAP 为空")
+
+    literal_hosts: set[str] = set()
+    for index, api_url in enumerate(url_map.values(), start=1):
+        host = urlsplit(api_url).hostname or ""
+        literal_hosts.add(host)
+        try:
+            literal = ipaddress.ip_address(host)
+        except ValueError:
+            continue
+        if isinstance(literal, ipaddress.IPv6Address) and literal.ipv4_mapped is not None:
+            literal = literal.ipv4_mapped
+        if literal in _CGNAT_NETWORK and host not in approved:
+            raise RuntimeError(
+                f"WORKER_API_URL_MAP 第 {index} 项指向未写进 WORKER_API_TAILNET_IPS 的 CGNAT 地址"
+            )
+
+    for index, token in enumerate(raw_value.split(","), start=1):
+        if token.strip() not in literal_hosts:
+            raise RuntimeError(
+                f"WORKER_API_TAILNET_IPS 第 {index} 项没有出现在 WORKER_API_URL_MAP 的地址主机名里"
+            )
+    return frozenset(approved)
+
+
+WORKER_API_TAILNET_IPS = _load_worker_api_tailnet_ips(os.getenv("WORKER_API_TAILNET_IPS", ""), WORKER_API_URL_MAP)
+if WORKER_API_TAILNET_IPS:
+    logger.info(
+        "🔐 WORKER_API_TAILNET_IPS 已启用：%s 个映射中的 TailIP 字面量允许通过 CGNAT 检查。",
+        len(WORKER_API_TAILNET_IPS),
+    )
 
 
 def resolve_worker_api_url(worker_node: str, reported_api_url: str) -> str:
@@ -589,7 +703,7 @@ def resolve_dispatch_api_url(worker_node: str, registered_api_url: str) -> Optio
     try:
         trusted = worker_node in WORKER_API_URL_MAP
         return verify_dispatch_target(
-            resolve_worker_api_url(worker_node, registered_api_url), trusted_source=trusted
+            resolve_worker_api_url(worker_node, registered_api_url), trusted_source=trusted, worker_node=worker_node
         )
     except HTTPException:
         if WORKER_API_URL_MAP and worker_node not in WORKER_API_URL_MAP:
@@ -1529,7 +1643,12 @@ def requeue_stale_not_found_tasks(cursor) -> int:
 
 # ================= 核心调度：大批次 + 节点限流 =================
 def dispatch_uploader_tasks() -> bool:
-    """定时与即时调度的唯一入口；返回 False 表示已有调度在运行，本次跳过。"""
+    """定时与即时调度的唯一入口；返回 False 表示已有调度在运行，本次跳过。
+
+    UPLOADER_DISPATCH_ENABLED=false 时在拿锁、连库之前返回 True：即时触发不会把它当成"调度忙"反复重试。
+    """
+    if not UPLOADER_DISPATCH_ENABLED:
+        return True
     if not _dispatch_run_lock.acquire(blocking=False):
         logger.info("⏭️ 本进程已有 uploader 调度在运行，跳过本次调度。")
         return False
