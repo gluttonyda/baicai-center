@@ -16,8 +16,8 @@ services:
       - /data/rclone-cache:/data/rclone-cache
       - ./logs/rclone:/data/logs/rclone
       - ./runtime:/opt/baicai-worker/runtime
-      # 镜像已内置 rclone 1.65.2（支持带 @ 的 remote 名）；这个挂载是可选的：
-      # 只有想固定用宿主机特定版本时才需要，新节点可以直接删掉。
+      # 镜像已内置 rclone 1.65.2（/usr/local/bin/rclone，在 PATH 上优先于 /usr/bin）；
+      # 这个挂载实际不会被使用，也不能用来固定宿主机版本，新节点可以直接删掉。
       - /usr/bin/rclone:/usr/bin/rclone:ro
       - /root/.config/rclone:/root/.config/rclone
 

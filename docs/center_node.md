@@ -83,7 +83,7 @@ Worker 重启恢复 journal 任务前，核对该批次仍归属本节点且存�
 
 Center 启动后会运行后台调度器：
 
-- uploader 调度：每 60 秒执行一次
+- uploader 调度：每 60 秒执行一次；`UPLOADER_DISPATCH_ENABLED=false` 时整轮跳过（见下）
 - cleaner 调度：启用 `CLEANER_DISPATCH_ENABLED` 时按 `CLEANER_DISPATCH_INTERVAL_MINUTES` 执行
 - cleaner 强制巡检：启用 cleaner 调度时每天 03:00 执行一次
 
@@ -94,6 +94,8 @@ Asia/Shanghai
 ```
 
 定时 uploader 调度与 403/凭据失效后的即时调度共用一个进程内非阻塞锁，同一时刻只运行一轮。即时触发遇到调度忙时短暂重试，最长 `DISPATCH_TRIGGER_MAX_WAIT_SECONDS`（默认 120 秒）。每轮调度还会在一个不进入连接池的专用连接上获取 MySQL `GET_LOCK`；多个 Center 进程共用同一库时，未抢到锁的进程跳过本轮。这里没有实现选主，cleaner 调度也不在该互斥范围内。默认镜像只运行一个 uvicorn 进程。
+
+`UPLOADER_DISPATCH_ENABLED`（默认 true）是维护开关。设为 false 后，`dispatch_uploader_tasks()` 在拿进程锁、MySQL 命名锁和连接数据库之前直接返回，定时调度和 403/凭据失效后的即时调度都不执行，包括失联节点与 `uploading` 超时的回收；启动日志提示一次。它只冻结下一轮起的调度：不取消已在执行的轮次，不冻结 `report_status`/`report_files` 等接口的写库，也不阻止 Worker 启动时的 journal 恢复。取值只接受 true/false/1/0/yes/no/on/off（不区分大小写，可带首尾空白），其它取值拒绝启动且报错不回显原值。cleaner 继续用 `CLEANER_DISPATCH_ENABLED=false` 关闭。
 
 连接池使用 `ping=1`：每次从池中取出连接时都会检测，并替换被服务端超时或 `KILL` 断开的连接。
 
@@ -313,7 +315,8 @@ NODE_TOKEN=CHANGE_ME_WITH_INIT_SCANNER_TOKEN
 
 - `WORKER_API_URL_MAP` 非空时，Center 只接受白名单中的 Worker；派发时也按当前映射取地址，修改映射立即生效，名单外的已注册节点不再收到新任务
 - `WORKER_API_URL_MAP` 为空时，Center 信任节点上报的 `worker_api_url` 并向其发起请求。签名节点（以及启用 legacy 时持有共享令牌的调用方）可以借此让 Center 访问任意 HTTP/HTTPS 地址。为兼容现有部署，空映射默认仍可启动，并在启动日志中警告一次；`REQUIRE_WORKER_API_URL_MAP=true` 时空映射（包括 `{}`）拒绝启动。生产环境应配置完整白名单并开启该开关
-- `worker_api_url` 必须是完整 HTTP/HTTPS URL，不允许 `user:password@` 用户信息、空主机名、端口不是 1-65535 的纯数字，或包含空白/控制字符；内网主机名、IP 和自定义端口可以使用。映射中的地址遵守同样规则。不合法的上报返回 422，不合法的历史注册地址在派发时跳过
+- Worker 走 Tailscale 等 CGNAT 地址时，把精确 TailIP 写进 `WORKER_API_TAILNET_IPS`（逗号分隔的规范 IPv4），并在 `WORKER_API_URL_MAP` 里用同一 IP 字面量写完整 URL。启动时双向核对：列出的 IP 都要出现在 map 里，map 里的 CGNAT 字面量也都要列出，否则拒绝启动（报错只给序号，不回显节点名、IP 或 URL）。运行时只有“白名单来源 + 节点名 + 完整 URL 等于该节点的映射 + 主机串就是批准的 IP”才跳过 CGNAT 这一条规则，其余拒绝规则照常；主机名解析到 TailIP、v4-mapped/十进制等变形写法、`WORKER_API_ALLOWED_HOSTS`、节点自报地址都拿不到豁免；`100.100.100.0/24` 永不豁免。留空时与旧版行为一致
+- `worker_api_url` 必须是完整 HTTP/HTTPS URL，不允许 `user:password@` 用户信息、空主机名、端口不是 1-65535 的纯数字，或包含空白/控制字符；内网主机名、IP 和自定义端口可以使用。映射中的地址遵守同样规则，不合法时拒绝启动，报错只给序号（`第 N 项`），不回显节点名、URL 或解析器的原始异常。不合法的上报返回 422，不合法的历史注册地址在派发时跳过
 - 数据库缺少必填环境变量时，服务会直接启动失败
 - Center 不需要部署 `worker.py` 和 `scanner.py`
 - 公开仓库不要提交 `.env`、数据库备份和运行日志

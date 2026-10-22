@@ -10,6 +10,8 @@ import os
 import sys
 import threading
 import time
+import traceback
+from urllib.parse import urlsplit
 
 import pytest
 from fastapi.testclient import TestClient
@@ -2135,8 +2137,39 @@ def test_load_worker_api_url_map_rejects_blank_node_name(monkeypatch):
 def test_validate_worker_api_url_map_entries_rejects_invalid_entry(monkeypatch):
     monkeypatch.setattr(main, "WORKER_API_URL_MAP", {"worker-node-1": "ftp://worker-node-1/task/upload"})
 
-    with pytest.raises(RuntimeError, match="worker-node-1"):
+    with pytest.raises(RuntimeError, match="第 1 项的地址非法") as excinfo:
         main._validate_worker_api_url_map_entries()
+
+    assert "worker-node-1" not in _formatted(excinfo.value)
+
+
+def test_validate_worker_api_url_map_entries_traceback_has_no_raw_port(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "WORKER_API_URL_MAP",
+        {"SENTINEL_SECRET_NODE": "http://100.125.75.111:SENTINEL_SECRET_PORT/task/upload"},
+    )
+
+    with pytest.raises(RuntimeError, match="第 1 项的地址非法: worker_api_url 端口非法") as excinfo:
+        main._validate_worker_api_url_map_entries()
+
+    text = _formatted(excinfo.value)
+    assert "SENTINEL" not in text
+    assert "100.125.75.111" not in text
+
+
+@pytest.mark.parametrize(
+    "api_url",
+    ["http://worker-node-1:SENTINEL_SECRET_PORT/task/upload", "http://SENTINEL_SECRET_HOST℀x:8001/task/upload"],
+    ids=["bad-port", "nfkc-netloc"],
+)
+def test_validate_api_url_does_not_chain_raw_parser_errors(api_url):
+    # urlsplit/parts.port 的原始 ValueError 带端口串或整个 netloc，不能挂在异常链上。
+    with pytest.raises(ValueError) as excinfo:
+        main.validate_api_url(api_url)
+
+    assert excinfo.value.__cause__ is None and excinfo.value.__suppress_context__
+    assert "SENTINEL" not in _formatted(excinfo.value)
 
 
 def test_report_status_completed_for_v2_worker_does_not_mark_whole_batch(mock_db, caplog):
@@ -2662,3 +2695,433 @@ def test_allowlist_does_not_bypass_metadata_addresses(monkeypatch):
     main._DNS_CACHE.clear()
     with pytest.raises(ValueError):
         main.verify_dispatch_target("http://proxy.local/latest/meta-data/")
+
+
+# ===== Tailnet 精确豁免（Issue #22） =====
+
+TAILNET_MAP = {
+    "Gomami-1": "http://100.125.75.111:8001/task/upload",
+    "Gomami-2": "http://100.100.185.27:8001/task/upload",
+    "1GServer-US": "http://100.91.91.88:8001/task/upload",
+}
+TAILNET_IPS = frozenset({"100.125.75.111", "100.100.185.27", "100.91.91.88"})
+
+
+def _no_dns(*args, **kwargs):
+    raise AssertionError("精确 TailIP 字面量与启动校验都不应触发 DNS 解析")
+
+
+@pytest.fixture
+def tailnet_policy(monkeypatch):
+    """模拟 loader 校验通过后的运行时状态；raising=False 让基线上的用例以断言失败呈现。"""
+    monkeypatch.setattr(main, "WORKER_API_URL_MAP", dict(TAILNET_MAP))
+    monkeypatch.setattr(main, "WORKER_API_TAILNET_IPS", TAILNET_IPS, raising=False)
+    monkeypatch.setattr(main, "TRUST_SELF_REPORTED_WORKER_API_URL", False)
+    monkeypatch.setattr(main, "WORKER_API_ALLOWED_HOSTS", frozenset())
+    monkeypatch.setattr(main.socket, "getaddrinfo", _no_dns)
+    main._DNS_CACHE.clear()
+    return monkeypatch
+
+
+def test_worker_api_tailnet_ips_defaults_to_empty():
+    assert main.WORKER_API_TAILNET_IPS == frozenset()
+
+
+@pytest.mark.parametrize("allow_private", [True, False])
+@pytest.mark.parametrize("node", sorted(TAILNET_MAP))
+def test_approved_tailnet_ip_from_map_is_dispatchable_without_dns(tailnet_policy, node, allow_private):
+    tailnet_policy.setattr(main, "ALLOW_PRIVATE_WORKER_URLS", allow_private)
+
+    assert main.resolve_dispatch_api_url(node, "") == TAILNET_MAP[node]
+    # worker_registry 里的历史地址不影响结果：白名单命中即用映射地址。
+    assert main.resolve_dispatch_api_url(node, STALE_REGISTRY_URL) == TAILNET_MAP[node]
+
+
+@pytest.mark.parametrize("node", sorted(TAILNET_MAP))
+def test_tailnet_ip_stays_blocked_when_approved_list_is_empty(tailnet_policy, node):
+    tailnet_policy.setattr(main, "WORKER_API_TAILNET_IPS", frozenset(), raising=False)
+
+    assert main.resolve_dispatch_api_url(node, "") is None
+    with pytest.raises(ValueError):
+        main.verify_dispatch_target(TAILNET_MAP[node], trusted_source=True)
+
+
+@pytest.mark.parametrize(
+    ("api_url", "trusted_source", "worker_node"),
+    [
+        (TAILNET_MAP["Gomami-1"], True, None),
+        (TAILNET_MAP["Gomami-1"], False, "Gomami-1"),
+        (TAILNET_MAP["Gomami-1"], True, "Gomami-2"),
+        (TAILNET_MAP["Gomami-1"], True, "unknown-node"),
+        ("http://100.125.75.111:8002/task/upload", True, "Gomami-1"),
+        ("http://100.125.75.111/task/upload", True, "Gomami-1"),
+        ("http://100.125.75.111:8001/other", True, "Gomami-1"),
+        ("http://100.125.75.111:8001/task/upload?x=1", True, "Gomami-1"),
+        ("https://100.125.75.111:8001/task/upload", True, "Gomami-1"),
+        ("http://[::ffff:100.125.75.111]:8001/task/upload", True, "Gomami-1"),
+    ],
+    ids=[
+        "missing-node", "untrusted", "node-mismatch", "unknown-node", "port-mismatch",
+        "default-port", "path-mismatch", "query-added", "scheme-mismatch", "v4-mapped",
+    ],
+)
+def test_tailnet_exemption_requires_trusted_node_and_exact_map_url(
+    tailnet_policy, api_url, trusted_source, worker_node
+):
+    with pytest.raises(ValueError):
+        main.verify_dispatch_target(api_url, trusted_source, worker_node=worker_node)
+
+
+@pytest.mark.parametrize("map_empty", [True, False])
+def test_self_reported_tailnet_url_never_borrows_approval(tailnet_policy, map_empty):
+    tailnet_policy.setattr(main, "TRUST_SELF_REPORTED_WORKER_API_URL", True)
+    if map_empty:
+        tailnet_policy.setattr(main, "WORKER_API_URL_MAP", {})
+        for node, url in TAILNET_MAP.items():
+            assert main.resolve_dispatch_api_url(node, url) is None
+    else:
+        assert main.resolve_dispatch_api_url("self-reporting-node", TAILNET_MAP["Gomami-1"]) is None
+
+
+@pytest.mark.parametrize("address", ["100.64.0.1", "100.125.75.112", "100.127.255.254"])
+def test_unapproved_cgnat_in_map_stays_blocked_when_feature_enabled(tailnet_policy, address):
+    url = f"http://{address}:8001/task/upload"
+    tailnet_policy.setattr(main, "WORKER_API_URL_MAP", {**TAILNET_MAP, "extra-node": url})
+
+    assert main.resolve_dispatch_api_url("extra-node", "") is None
+
+
+def test_hostname_resolving_to_approved_tailnet_ip_is_still_blocked(tailnet_policy):
+    """DNS 分支永远不带豁免：主机名解析到已批准 IP、即使主机名在 allowlist 里，也照样拒绝。"""
+    url = "http://gomami-1.tailnet.example:8001/task/upload"
+    tailnet_policy.setattr(main, "WORKER_API_URL_MAP", {"Gomami-1": url})
+    tailnet_policy.setattr(main, "WORKER_API_ALLOWED_HOSTS", frozenset({"gomami-1.tailnet.example"}))
+    tailnet_policy.setattr(
+        main.socket,
+        "getaddrinfo",
+        lambda host, port, *args, **kwargs: [(2, 1, 6, "", ("100.125.75.111", port))],
+    )
+    main._DNS_CACHE.clear()
+
+    assert main.resolve_dispatch_api_url("Gomami-1", "") is None
+    with pytest.raises(ValueError):
+        main.verify_dispatch_target(url, True, worker_node="Gomami-1")
+
+
+def test_host_allowlist_alone_cannot_open_tailnet_ip(tailnet_policy):
+    tailnet_policy.setattr(main, "WORKER_API_TAILNET_IPS", frozenset(), raising=False)
+    tailnet_policy.setattr(main, "WORKER_API_ALLOWED_HOSTS", frozenset({"100.125.75.111"}))
+
+    assert main.resolve_dispatch_api_url("Gomami-1", "") is None
+
+
+@pytest.mark.parametrize(
+    "variant_host",
+    [
+        "1685932911",            # 十进制整数形式的 100.125.75.111
+        "0x647d4b6f",            # 十六进制
+        "0144.0175.0113.0157",   # 八进制
+        "100.125.75.111.",       # 末尾点
+    ],
+)
+def test_alternate_forms_of_approved_ip_never_get_exemption(tailnet_policy, variant_host):
+    """变形写法即使原样写进 map、规范 IP 也在批准列表里，主机串不等于规范文本，就走 DNS 分支且不带豁免。"""
+    from conftest import REAL_GETADDRINFO
+
+    url = f"http://{variant_host}:8001/task/upload"
+    tailnet_policy.setattr(main, "WORKER_API_URL_MAP", {"Gomami-1": url})
+    tailnet_policy.setattr(main.socket, "getaddrinfo", REAL_GETADDRINFO)
+    main._DNS_CACHE.clear()
+
+    assert main.resolve_dispatch_api_url("Gomami-1", "") is None
+
+
+def test_v4_mapped_form_never_exempt_even_if_forced_into_approved_list(tailnet_policy):
+    url = "http://[::ffff:100.125.75.111]:8001/task/upload"
+    tailnet_policy.setattr(main, "WORKER_API_URL_MAP", {"Gomami-1": url})
+    tailnet_policy.setattr(
+        main, "WORKER_API_TAILNET_IPS", frozenset({"::ffff:100.125.75.111", "100.125.75.111"}), raising=False
+    )
+
+    assert main.resolve_dispatch_api_url("Gomami-1", "") is None
+
+
+@pytest.mark.parametrize("api_url,label", CLOUD_METADATA_ENDPOINTS, ids=[item[1] for item in CLOUD_METADATA_ENDPOINTS])
+def test_metadata_endpoints_blocked_even_when_forced_into_tailnet_approval(tailnet_policy, api_url, label):
+    host = urlsplit(api_url).hostname
+    tailnet_policy.setattr(main, "WORKER_API_URL_MAP", {"forced-node": api_url})
+    tailnet_policy.setattr(main, "WORKER_API_TAILNET_IPS", frozenset({host}), raising=False)
+
+    for allow_private in (True, False):
+        tailnet_policy.setattr(main, "ALLOW_PRIVATE_WORKER_URLS", allow_private)
+        with pytest.raises(ValueError):
+            main.verify_dispatch_target(api_url, True, worker_node="forced-node")
+        assert main.resolve_dispatch_api_url("forced-node", "") is None
+
+
+@pytest.mark.parametrize("address", ["100.100.100.0", "100.100.100.100", "100.100.100.200", "100.100.100.255"])
+def test_tailscale_service_range_never_exempt_at_runtime(tailnet_policy, address):
+    """100.100.100.0/24（Tailscale 服务地址、阿里云元数据）绕过 loader 硬塞进批准列表也照样拒绝。"""
+    url = f"http://{address}:8001/task/upload"
+    tailnet_policy.setattr(main, "WORKER_API_URL_MAP", {"forced-node": url})
+    tailnet_policy.setattr(main, "WORKER_API_TAILNET_IPS", frozenset({address}), raising=False)
+
+    with pytest.raises(ValueError):
+        main.verify_dispatch_target(url, True, worker_node="forced-node")
+    assert main.resolve_dispatch_api_url("forced-node", "") is None
+
+
+def test_tailnet_exemption_skips_only_cgnat_rule(monkeypatch):
+    """豁免只跳过 CGNAT 这一条：其它硬拒规则仍然生效，不提前 return。"""
+    monkeypatch.setattr(main, "ALLOW_PRIVATE_WORKER_URLS", False)
+
+    assert main._blocked_address_reason(ipaddress.ip_address("100.125.75.111"), tailnet_approved=True) is None
+    for address in ("169.254.169.254", "127.0.0.1", "192.0.0.192", "0.1.2.3", "100.100.100.200"):
+        assert main._blocked_address_reason(ipaddress.ip_address(address), tailnet_approved=True), address
+    assert main._blocked_address_reason(ipaddress.ip_address("::ffff:100.125.75.111"), tailnet_approved=True)
+    assert main._blocked_address_reason(ipaddress.ip_address("100.125.75.111"))
+
+
+@pytest.mark.parametrize("approved", [True, False])
+def test_dispatch_uploader_tasks_tailnet_target_follows_approved_list(monkeypatch, approved):
+    monkeypatch.setattr(main, "WORKER_API_TAILNET_IPS", TAILNET_IPS if approved else frozenset(), raising=False)
+    monkeypatch.setattr(main.socket, "getaddrinfo", _no_dns)
+    cursor = _uploader_dispatch_cursor([{"node_name": "Gomami-1", "api_url": STALE_REGISTRY_URL}])
+
+    targets = _run_dispatch_and_collect_targets(main.dispatch_uploader_tasks, cursor, dict(TAILNET_MAP))
+
+    if approved:
+        assert targets == [(TAILNET_MAP["Gomami-1"], "Gomami-1")]
+    else:
+        assert targets == []
+        assert _updates_touching_node(cursor, "Gomami-1") == []
+
+
+@pytest.mark.parametrize("approved", [True, False])
+def test_dispatch_cleaner_tasks_tailnet_target_follows_approved_list(monkeypatch, approved):
+    monkeypatch.setattr(main, "WORKER_API_TAILNET_IPS", TAILNET_IPS if approved else frozenset(), raising=False)
+    monkeypatch.setattr(main.socket, "getaddrinfo", _no_dns)
+    cursor = _cleaner_dispatch_cursor({"Gomami-1": STALE_REGISTRY_URL})
+
+    targets = _run_dispatch_and_collect_targets(main.dispatch_cleaner_tasks, cursor, dict(TAILNET_MAP))
+
+    if approved:
+        assert targets == [(TAILNET_MAP["Gomami-1"], "Gomami-1")]
+    else:
+        assert targets == []
+        assert _updates_touching_node(cursor, "Gomami-1") == []
+
+
+def test_dispatch_uploader_tasks_and_cleaner_pass_worker_node_to_target_check(monkeypatch):
+    """uploader 与 cleaner 共用同一出站校验，并且都把节点名交给它（豁免必须绑定节点）。"""
+    calls = []
+    real_verify = main.verify_dispatch_target
+
+    def spy(api_url, trusted_source=False, **kwargs):
+        calls.append((api_url, trusted_source, kwargs))
+        return real_verify(api_url, trusted_source, **kwargs)
+
+    monkeypatch.setattr(main, "verify_dispatch_target", spy)
+    url_map = {"worker-node-1": MAPPED_URL}
+    _run_dispatch_and_collect_targets(
+        main.dispatch_uploader_tasks,
+        _uploader_dispatch_cursor([{"node_name": "worker-node-1", "api_url": STALE_REGISTRY_URL}]),
+        url_map,
+    )
+    _run_dispatch_and_collect_targets(
+        main.dispatch_cleaner_tasks, _cleaner_dispatch_cursor({"worker-node-1": STALE_REGISTRY_URL}), url_map
+    )
+
+    assert calls == [(MAPPED_URL, True, {"worker_node": "worker-node-1"})] * 2
+
+
+# ----- 启动配置 WORKER_API_TAILNET_IPS（loader） -----
+
+
+@pytest.fixture
+def loader_no_dns(monkeypatch):
+    monkeypatch.setattr(main.socket, "getaddrinfo", _no_dns)
+    monkeypatch.setattr(main.socket, "gethostbyname", _no_dns)
+
+
+def _formatted(exc: BaseException) -> str:
+    return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+
+
+def test_tailnet_loader_accepts_exact_list_without_dns(loader_no_dns):
+    raw = " 100.125.75.111 , 100.100.185.27,100.91.91.88 "
+
+    assert main._load_worker_api_tailnet_ips(raw, dict(TAILNET_MAP)) == TAILNET_IPS
+
+
+@pytest.mark.parametrize("raw", ["", "   "])
+def test_tailnet_loader_empty_keeps_legacy_behaviour(loader_no_dns, raw):
+    """默认空：不给旧 map 增加新约束（map 里的 CGNAT 字面量照旧由运行时拒绝）。"""
+    assert main._load_worker_api_tailnet_ips(raw, {"legacy": "http://100.64.0.1:8001/task/upload"}) == frozenset()
+    assert main._load_worker_api_tailnet_ips(raw, {}) == frozenset()
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "100.125.75.111,,100.100.185.27,100.91.91.88",
+        "100.125.75.111,100.100.185.27,100.91.91.88,",
+        ",100.125.75.111,100.100.185.27,100.91.91.88",
+        "100.125.75.0111,100.100.185.27,100.91.91.88",
+        "100.125.075.111,100.100.185.27,100.91.91.88",
+        "100.125.75,100.100.185.27,100.91.91.88",
+        "100.125.75.111/32,100.100.185.27,100.91.91.88",
+        "100.64.0.0/10",
+        "100.125.75.110-100.125.75.111,100.100.185.27,100.91.91.88",
+        "100.125.75.111 100.100.185.27,100.91.91.88",
+        "100.125.75.111;100.100.185.27;100.91.91.88",
+        "fd7a:115c:a1e0::1",
+        "::ffff:100.125.75.111,100.100.185.27,100.91.91.88",
+        "SENTINEL-gomami-1.tailnet.example,100.100.185.27,100.91.91.88",
+        "1685932911,100.100.185.27,100.91.91.88",
+        "10.0.0.5",
+        "169.254.169.254",
+        "100.100.100.100",
+        "100.100.100.200",
+    ],
+)
+def test_tailnet_loader_rejects_non_canonical_or_forbidden_tokens(loader_no_dns, raw):
+    url_map = {**TAILNET_MAP, "n10": "http://10.0.0.5:8001/task/upload"}
+
+    with pytest.raises(RuntimeError) as excinfo:
+        main._load_worker_api_tailnet_ips(raw, url_map)
+
+    text = _formatted(excinfo.value)
+    assert "WORKER_API_TAILNET_IPS" in str(excinfo.value)
+    for token in (part.strip() for part in raw.split(",")):
+        if token:
+            assert token not in text
+
+
+@pytest.mark.parametrize(
+    ("raw", "url_map"),
+    [
+        # 列出的 IP 没有对应的 map 字面量。
+        ("100.125.75.111,100.100.185.27,100.91.91.88,100.88.1.2", dict(TAILNET_MAP)),
+        # map 里有未批准的 CGNAT 字面量。
+        ("100.125.75.111,100.100.185.27,100.91.91.88", {**TAILNET_MAP, "extra-node": "http://100.88.1.2:8001/SENTINEL-path"}),
+        # map 里 v4-mapped 写法的 CGNAT 同样不可能被批准。
+        ("100.125.75.111,100.100.185.27,100.91.91.88", {**TAILNET_MAP, "extra-node": "http://[::ffff:100.88.1.2]:8001/x"}),
+        # 启用了列表但 map 为空。
+        ("100.125.75.111", {}),
+        # map 只用主机名或变形写法时，规范 IP 没有字面量批准。
+        ("100.125.75.111", {"Gomami-1": "http://100.125.75.111.:8001/task/upload"}),
+        ("100.125.75.111", {"Gomami-1": "http://gomami-1.tailnet.example:8001/task/upload"}),
+    ],
+    ids=["ip-missing-from-map", "map-cgnat-unapproved", "map-v4-mapped-cgnat", "empty-map", "map-variant", "map-hostname"],
+)
+def test_tailnet_loader_requires_bidirectional_consistency_with_map(loader_no_dns, raw, url_map):
+    with pytest.raises(RuntimeError) as excinfo:
+        main._load_worker_api_tailnet_ips(raw, url_map)
+
+    text = _formatted(excinfo.value)
+    for url in url_map.values():
+        assert url not in text
+    assert "SENTINEL" not in text
+    assert "100.88.1.2" not in text
+
+
+@pytest.mark.parametrize("node_name", ["token=SENTINEL secret!", "SENTINEL_SECRET_NODE"])
+def test_tailnet_loader_never_echoes_map_keys(loader_no_dns, node_name):
+    # 形如普通节点名也不回显：正则证明不了它不是误填的凭据。
+    with pytest.raises(RuntimeError, match="WORKER_API_URL_MAP 第 2 项") as excinfo:
+        main._load_worker_api_tailnet_ips(
+            "100.125.75.111", {"Gomami-1": TAILNET_MAP["Gomami-1"], node_name: "http://100.88.1.2:8001/x"}
+        )
+
+    text = _formatted(excinfo.value)
+    assert "SENTINEL" not in text
+    assert "Gomami-1" not in text
+
+
+# ===== UPLOADER_DISPATCH_ENABLED 维护开关（Issue #23） =====
+
+
+def test_uploader_dispatch_enabled_defaults_to_true():
+    assert main.UPLOADER_DISPATCH_ENABLED is True
+
+
+@pytest.fixture
+def uploader_dispatch_disabled(monkeypatch):
+    """关闭开关，并把锁/DB/SQL/HTTP 全换成会记账的炸弹；返回被意外触碰的入口列表。"""
+    touched = []
+
+    def bomb(label):
+        def _explode(*args, **kwargs):
+            touched.append(label)
+            raise AssertionError(f"{label} must not run while UPLOADER_DISPATCH_ENABLED=false")
+        return _explode
+
+    class ExplodingLock:
+        acquire = staticmethod(bomb("_dispatch_run_lock.acquire"))
+        release = staticmethod(bomb("_dispatch_run_lock.release"))
+
+    monkeypatch.setattr(main, "UPLOADER_DISPATCH_ENABLED", False, raising=False)
+    monkeypatch.setattr(main, "_dispatch_run_lock", ExplodingLock())
+    monkeypatch.setattr(main, "_acquire_dispatch_db_lock", bomb("_acquire_dispatch_db_lock"))
+    monkeypatch.setattr(main, "_open_dispatch_lock_connection", bomb("_open_dispatch_lock_connection"))
+    monkeypatch.setattr(main, "get_db_connection", bomb("get_db_connection"))
+    monkeypatch.setattr(main, "_dispatch_uploader_tasks_locked", bomb("_dispatch_uploader_tasks_locked"))
+    monkeypatch.setattr(main.httpx, "post", bomb("httpx.post"))
+    return touched
+
+
+def test_dispatch_uploader_tasks_disabled_returns_true_without_lock_db_sql_or_http(uploader_dispatch_disabled):
+    assert main.dispatch_uploader_tasks() is True
+    assert uploader_dispatch_disabled == []
+
+
+def test_trigger_dispatch_uploader_tasks_async_is_noop_when_disabled(uploader_dispatch_disabled, monkeypatch):
+    """即时触发（配额/凭据失效回执）在关闭时一次返回 True，不进入"调度忙"重试循环，也不留线程。"""
+    results = []
+    real_dispatch = main.dispatch_uploader_tasks
+
+    def recording_dispatch():
+        result = real_dispatch()
+        results.append(result)
+        return result
+
+    monkeypatch.setattr(main, "dispatch_uploader_tasks", recording_dispatch)
+    before = set(threading.enumerate())
+
+    main.trigger_dispatch_uploader_tasks_async("test: quota exhausted")
+
+    for thread in [t for t in threading.enumerate() if t not in before]:
+        thread.join(5)
+        assert not thread.is_alive()
+    assert results == [True]
+    assert uploader_dispatch_disabled == []
+
+
+def test_scheduled_uploader_job_is_noop_when_disabled(uploader_dispatch_disabled, monkeypatch):
+    """定时入口：lifespan 注册的 uploader 任务在关闭时同样只返回 True。调度器替身不启动任何线程。"""
+    jobs = []
+
+    class FakeScheduler:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def add_job(self, func, *args, **kwargs):
+            jobs.append(func)
+
+        def start(self):
+            pass
+
+        def shutdown(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(main, "BackgroundScheduler", FakeScheduler)
+    monkeypatch.setattr(main, "log_worker_api_url_map_gaps", lambda: None)
+
+    with TestClient(main.app):
+        pass
+
+    uploader_jobs = [job for job in jobs if job is main.dispatch_uploader_tasks]
+    assert uploader_jobs
+    assert [job() for job in uploader_jobs] == [True] * len(uploader_jobs)
+    assert uploader_dispatch_disabled == []

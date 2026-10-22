@@ -83,7 +83,7 @@ CACHE_DB_PATH
 `baicai-work/Dockerfile` 直接安装官方 rclone 构建（当前固定 `1.65.2`，amd64/arm64/arm 分别校验 SHA256），不再使用发行版仓库里的 1.60.1——那个版本不接受含 `@` 的 remote 名，而现场账号名（`baicai_1@1`）都带 `@`。
 
 - 只有指向本机目录的 rclone 配置需要额外挂载（`/root/.config/rclone`）。
-- 宿主机 rclone 挂载（`/usr/bin/rclone`）**已不再必需**：新版节点可以直接删掉这一行；保留它只是为了让想固定宿主机版本的老节点行为不变。
+- 宿主机 rclone 挂载（`/usr/bin/rclone`）**已不起作用**：镜像把官方 rclone 装在 `/usr/local/bin/rclone`，Worker 按 `PATH` 调用 `rclone`，而 `/usr/local/bin` 排在 `/usr/bin` 之前，所以实际执行的始终是镜像内版本。保留这行挂载无害，但**不能**用它固定宿主机版本；新节点可以直接删掉。核对方式：`docker run --rm --network none --entrypoint sh <镜像> -c 'command -v rclone; rclone version | head -1'`。
 - CI 会在 `worker image (linux/amd64)` 与 `worker image (linux/arm64)` 两个 job 里断言版本 ≥ 1.65，并真的用 `rclone lsf "baicai_1@1:"` 解析一次带 `@` 的 remote，防止回退。
 
 ## rclone 行为
@@ -170,7 +170,7 @@ docker compose up -d --build
 /root/.config/rclone -> /root/.config/rclone
 ```
 
-前三项是宿主机绝对路径；调整时同时对齐 Compose 挂载、Scanner 的 `*_SCAN_DIR` 和 Worker 的 `ALLOWED_BASE_DIRS`。宿主机的 rclone 二进制也需可执行且兼容已有 remote 配置。
+前三项是宿主机绝对路径；调整时同时对齐 Compose 挂载、Scanner 的 `*_SCAN_DIR` 和 Worker 的 `ALLOWED_BASE_DIRS`。`/usr/bin/rclone` 挂载不会被使用（镜像内 `/usr/local/bin/rclone` 在 `PATH` 上优先，见上文“镜像内的 rclone”）；真正需要的是 `/root/.config/rclone` 里的 remote 配置。
 
 `TASK_JOURNAL_DB_PATH` 默认位于持久化的 `runtime/`：任务先落盘再启动，最终回执失败后定时补送；恢复任务前向 Center 校验当前租约，已过期或改派的批次取消。普通重启不要删除该目录。
 

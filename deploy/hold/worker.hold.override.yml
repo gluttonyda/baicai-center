@@ -1,0 +1,38 @@
+# 维护期 hold override（Worker 节点）。只配合 deploy/hold/hold_install.py 创建容器，不用于启动。
+# 叠加在现场 baicai-work/docker-compose.yml 之后，.env、基础 compose、runtime、媒体目录与端口一字不改。
+# 只覆盖：镜像、build、重启策略、三个业务 URL，以及 worker-api、scanner 各自当前实际的接单并发；
+# 挂载（含可有可无的宿主机 /usr/bin/rclone）、端口、env_file、命令保持现场配置。
+#
+# 必填变量（在执行安装助手的 shell 环境里 export；缺任一项 compose 求值即失败）：
+#   BAICAI_HOLD_WORKER_IMAGE    三台一致的固定本地 tag，如 baicai-worker:<R12>-<release-id>-amd64
+#   BAICAI_HOLD_CENTER_URL      Center 的 tailnet 根地址，不带结尾 /，如 http://<Center TailIP>:8080
+#   BAICAI_HOLD_WORKER_API_URL  本机 tailnet 上传接口，如 http://<本机 TailIP>:8001/task/upload
+#   BAICAI_HOLD_UPLOADS_DAY / BAICAI_HOLD_UPLOADS_NIGHT
+#                               按“当前 worker-api 容器”inspect 出的实际值固定，不取 .env。
+#   BAICAI_HOLD_SCANNER_UPLOADS_DAY / BAICAI_HOLD_SCANNER_UPLOADS_NIGHT
+#                               按“当前 scanner 容器”inspect 出的实际值固定，不取 .env、不照抄 worker-api：
+#                               旧 Scanner 可能没随 .env 更新重建，两者的值可以不同。
+# 安装助手会逐字比对这四个值与对应旧容器的实际值，旧容器缺键或任一不同都拒绝创建。
+x-baicai-hold-urls: &baicai-hold-urls
+  CENTER_URL: ${BAICAI_HOLD_CENTER_URL:?set the Center tailnet URL}
+  CENTER_API: ${BAICAI_HOLD_CENTER_URL:?set the Center tailnet URL}/api/report_files
+  WORKER_API_URL: ${BAICAI_HOLD_WORKER_API_URL:?set this node tailnet upload URL}
+
+services:
+  worker-api:
+    image: ${BAICAI_HOLD_WORKER_IMAGE:?set a pinned local image tag}
+    build: !reset null
+    restart: "no"
+    environment:
+      <<: *baicai-hold-urls
+      MAX_CONCURRENT_UPLOADS_PER_WORKER_DAY: ${BAICAI_HOLD_UPLOADS_DAY:?pin the current worker-api value}
+      MAX_CONCURRENT_UPLOADS_PER_WORKER_NIGHT: ${BAICAI_HOLD_UPLOADS_NIGHT:?pin the current worker-api value}
+
+  scanner:
+    image: ${BAICAI_HOLD_WORKER_IMAGE:?set a pinned local image tag}
+    build: !reset null
+    restart: "no"
+    environment:
+      <<: *baicai-hold-urls
+      MAX_CONCURRENT_UPLOADS_PER_WORKER_DAY: ${BAICAI_HOLD_SCANNER_UPLOADS_DAY:?pin the current scanner value}
+      MAX_CONCURRENT_UPLOADS_PER_WORKER_NIGHT: ${BAICAI_HOLD_SCANNER_UPLOADS_NIGHT:?pin the current scanner value}
